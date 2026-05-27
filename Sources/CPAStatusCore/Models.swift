@@ -36,6 +36,7 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
     public let account: String?
     public let accountID: String?
     public let planType: String?
+    public let projectID: String?
     public let status: String?
     public let statusMessage: String?
     public let disabled: Bool
@@ -53,6 +54,22 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         normalizedProvider == "codex" || normalizedProvider.contains("openai")
     }
 
+    public var isAntigravity: Bool {
+        normalizedProvider == "antigravity"
+    }
+
+    public var isClaude: Bool {
+        normalizedProvider == "claude" || normalizedProvider == "anthropic"
+    }
+
+    public var isKimi: Bool {
+        normalizedProvider == "kimi"
+    }
+
+    public var isXAI: Bool {
+        normalizedProvider == "xai" || normalizedProvider == "x-ai" || normalizedProvider == "grok"
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id
         case authIndex = "auth_index"
@@ -67,6 +84,8 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         case accountID = "account_id"
         case planType = "plan_type"
         case plan
+        case projectID = "project_id"
+        case projectIDCamel = "projectId"
         case status
         case statusMessage = "status_message"
         case disabled
@@ -103,6 +122,10 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
             container.lossyString(forKey: .planType),
             container.lossyString(forKey: .plan)
         )
+        self.projectID = firstNonEmpty(
+            container.lossyString(forKey: .projectID),
+            container.lossyString(forKey: .projectIDCamel)
+        )
         self.status = container.lossyString(forKey: .status)
         self.statusMessage = container.lossyString(forKey: .statusMessage)
         self.disabled = container.lossyBool(forKey: .disabled) ?? false
@@ -117,6 +140,10 @@ public struct QuotaWindow: Equatable, Sendable {
     public let remainingPercent: Double?
     public let resetAfterSeconds: Double?
     public let resetAt: Date?
+    public let displayValue: String?
+    public let amountText: String?
+    public let detailText: String?
+    public let isUsable: Bool?
 
     public init(
         id: String,
@@ -124,7 +151,11 @@ public struct QuotaWindow: Equatable, Sendable {
         usedPercent: Double?,
         remainingPercent: Double?,
         resetAfterSeconds: Double?,
-        resetAt: Date?
+        resetAt: Date?,
+        displayValue: String? = nil,
+        amountText: String? = nil,
+        detailText: String? = nil,
+        isUsable: Bool? = nil
     ) {
         self.id = id
         self.label = label
@@ -132,9 +163,16 @@ public struct QuotaWindow: Equatable, Sendable {
         self.remainingPercent = remainingPercent
         self.resetAfterSeconds = resetAfterSeconds
         self.resetAt = resetAt
+        self.displayValue = displayValue
+        self.amountText = amountText
+        self.detailText = detailText
+        self.isUsable = isUsable
     }
 
     public var isExhausted: Bool {
+        if isUsable == false {
+            return true
+        }
         if let remainingPercent {
             return remainingPercent <= 0.01
         }
@@ -205,6 +243,22 @@ public struct AccountQuota: Identifiable, Equatable, Sendable {
 
     public var weeklyRemainingPercent: Double? {
         usage?.weekly?.remainingPercent
+    }
+
+    public var lowestRemainingPercent: Double? {
+        let values = quotaWindows.compactMap(\.remainingPercent)
+        return values.min()
+    }
+
+    public var hasUnusableQuotaWindow: Bool {
+        quotaWindows.contains { $0.isUsable == false }
+    }
+
+    private var quotaWindows: [QuotaWindow] {
+        [
+            usage?.primary,
+            usage?.weekly
+        ].compactMap { $0 } + (usage?.additionalWindows ?? [])
     }
 
     public var statusText: String {
@@ -278,18 +332,18 @@ public enum ProviderCatalog {
     private static let table: [String: ProviderInfo] = [
         "codex": ProviderInfo(key: "codex", displayName: "Codex", symbolName: "chevron.left.forwardslash.chevron.right", accentName: "teal", priority: 0, supportsUsage: true),
         "openai": ProviderInfo(key: "openai", displayName: "OpenAI", symbolName: "o.circle.fill", accentName: "mint", priority: 1, supportsUsage: true),
-        "claude": ProviderInfo(key: "claude", displayName: "Claude", symbolName: "c.circle.fill", accentName: "orange", priority: 2, supportsUsage: false),
-        "anthropic": ProviderInfo(key: "anthropic", displayName: "Claude", symbolName: "c.circle.fill", accentName: "orange", priority: 2, supportsUsage: false),
+        "claude": ProviderInfo(key: "claude", displayName: "Claude", symbolName: "c.circle.fill", accentName: "orange", priority: 2, supportsUsage: true),
+        "anthropic": ProviderInfo(key: "anthropic", displayName: "Claude", symbolName: "c.circle.fill", accentName: "orange", priority: 2, supportsUsage: true),
         "gemini": ProviderInfo(key: "gemini", displayName: "Gemini", symbolName: "g.circle.fill", accentName: "blue", priority: 3, supportsUsage: false),
         "gemini-cli": ProviderInfo(key: "gemini-cli", displayName: "Gemini CLI", symbolName: "g.circle", accentName: "blue", priority: 4, supportsUsage: false),
         "vertex": ProviderInfo(key: "vertex", displayName: "Vertex AI", symbolName: "cloud.fill", accentName: "indigo", priority: 5, supportsUsage: false),
-        "antigravity": ProviderInfo(key: "antigravity", displayName: "Antigravity", symbolName: "paperplane.fill", accentName: "purple", priority: 6, supportsUsage: false),
-        "xai": ProviderInfo(key: "xai", displayName: "xAI", symbolName: "x.circle.fill", accentName: "gray", priority: 7, supportsUsage: false),
-        "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: false)
+        "antigravity": ProviderInfo(key: "antigravity", displayName: "Antigravity", symbolName: "paperplane.fill", accentName: "purple", priority: 6, supportsUsage: true),
+        "xai": ProviderInfo(key: "xai", displayName: "Grok", symbolName: "x.circle.fill", accentName: "gray", priority: 7, supportsUsage: true),
+        "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: true)
     ]
 
     public static func info(for rawKey: String) -> ProviderInfo {
-        let normalized = rawKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalized = normalizeProviderKey(rawKey)
         if let exact = table[normalized] {
             return exact
         }
@@ -300,6 +354,17 @@ public enum ProviderCatalog {
             ? "Other"
             : normalized.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
         return ProviderInfo(key: normalized.isEmpty ? "other" : normalized, displayName: display, symbolName: "circle.dotted", accentName: "gray", priority: 200, supportsUsage: false)
+    }
+
+    private static func normalizeProviderKey(_ rawKey: String) -> String {
+        let normalized = rawKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        if normalized == "x-ai" || normalized == "grok" {
+            return "xai"
+        }
+        return normalized
     }
 }
 
@@ -383,6 +448,25 @@ public func displayDuration(seconds: Double?) -> String {
     let days = hours / 24
     let remainingHours = hours % 24
     return remainingHours == 0 ? "\(days)d" : "\(days)d \(remainingHours)h"
+}
+
+public func displayCredits(_ value: Double?) -> String {
+    guard let value, value.isFinite else {
+        return "--"
+    }
+    let clamped = max(0, value)
+    if clamped >= 1_000_000 {
+        let millions = clamped / 1_000_000
+        return millions >= 10 ? String(format: "%.0fM", millions) : String(format: "%.1fM", millions)
+    }
+    if clamped >= 1_000 {
+        let thousands = clamped / 1_000
+        return thousands >= 10 ? String(format: "%.0fK", thousands) : String(format: "%.1fK", thousands)
+    }
+    if clamped.rounded(.towardZero) == clamped {
+        return String(format: "%.0f", clamped)
+    }
+    return clamped < 10 ? String(format: "%.1f", clamped) : String(format: "%.0f", clamped)
 }
 
 private func cleanFileName(_ value: String?) -> String? {

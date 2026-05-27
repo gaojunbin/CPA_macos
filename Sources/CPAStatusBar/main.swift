@@ -799,17 +799,26 @@ final class PopoverViewController: NSViewController {
         } else if account.isUnavailable {
             stack.addArrangedSubview(noteLabel(text: "Unavailable"))
         } else if account.usage?.hasQuotaSignal == true {
-            let row5h = quotaLine(label: "5h", window: account.usage?.primary)
-            stack.addArrangedSubview(row5h)
-            row5h.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-
-            let row7d = quotaLine(label: "7d", window: account.usage?.weekly)
-            stack.addArrangedSubview(row7d)
-            row7d.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            for (labelText, window) in quotaRows(for: account.usage) {
+                let row = quotaLine(label: labelText, window: window)
+                stack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
         } else {
             stack.addArrangedSubview(noteLabel(text: "No quota signal yet"))
         }
         return card
+    }
+
+    private func quotaRows(for usage: UsageSnapshot?) -> [(String, QuotaWindow?)] {
+        guard let usage else { return [] }
+        var rows: [(String, QuotaWindow?)] = []
+        if usage.primary != nil || usage.weekly != nil {
+            rows.append(("5h", usage.primary))
+            rows.append(("7d", usage.weekly))
+        }
+        rows.append(contentsOf: usage.additionalWindows.map { ($0.label, Optional($0)) })
+        return rows
     }
 
     private func compactAccountRow(_ account: AccountQuota) -> NSView {
@@ -859,31 +868,56 @@ final class PopoverViewController: NSViewController {
     }
 
     private func quotaLine(label labelText: String, window: QuotaWindow?) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 4
 
-        let titleLabel = label(labelText, font: .systemFont(ofSize: 10, weight: .semibold), color: .tertiaryLabelColor)
-        titleLabel.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        row.addArrangedSubview(titleLabel)
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .firstBaseline
+        header.spacing = 8
+        container.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+
+        let titleLabel = label(labelText, font: .systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor)
+        titleLabel.lineBreakMode = .byTruncatingMiddle
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        header.addArrangedSubview(titleLabel)
+        header.addArrangedSubview(NSView())
+
+        let meta = NSStackView()
+        meta.orientation = .horizontal
+        meta.alignment = .firstBaseline
+        meta.spacing = 8
+        header.addArrangedSubview(meta)
+
+        let percent = label(window?.displayValue ?? displayPercent(window?.remainingPercent), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: .labelColor)
+        percent.alignment = .right
+        percent.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        meta.addArrangedSubview(percent)
+
+        if let amountText = window?.amountText, !amountText.isEmpty {
+            let amount = label(amountText, font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular), color: .secondaryLabelColor)
+            amount.alignment = .right
+            amount.lineBreakMode = .byTruncatingMiddle
+            amount.widthAnchor.constraint(equalToConstant: 92).isActive = true
+            meta.addArrangedSubview(amount)
+        }
+
+        let reset = label(resetText(window), font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular), color: .tertiaryLabelColor)
+        reset.alignment = .right
+        reset.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        meta.addArrangedSubview(reset)
 
         let bar = QuotaBarView()
         bar.value = window?.remainingPercent ?? 0
         bar.isMuted = window?.remainingPercent == nil
+        bar.isUnavailable = window?.isUsable == false
         bar.heightAnchor.constraint(equalToConstant: 6).isActive = true
-        row.addArrangedSubview(bar)
-
-        let percent = label(displayPercent(window?.remainingPercent), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: .labelColor)
-        percent.alignment = .right
-        percent.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        row.addArrangedSubview(percent)
-
-        let reset = label(resetText(window), font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular), color: .tertiaryLabelColor)
-        reset.alignment = .right
-        reset.widthAnchor.constraint(equalToConstant: 46).isActive = true
-        row.addArrangedSubview(reset)
-        return row
+        container.addArrangedSubview(bar)
+        bar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        return container
     }
 
     private func emptyDashboardView() -> NSView {
@@ -1071,6 +1105,9 @@ final class PopoverViewController: NSViewController {
 
     private func resetText(_ window: QuotaWindow?) -> String {
         guard let window else { return "" }
+        if let detail = window.detailText, !detail.isEmpty {
+            return detail
+        }
         if let seconds = window.resetAfterSeconds {
             return displayDuration(seconds: seconds)
         }
@@ -1088,7 +1125,10 @@ final class PopoverViewController: NSViewController {
         if account.isDisabled || account.isUnavailable {
             return .tertiaryLabelColor
         }
-        if let remaining = account.primaryRemainingPercent {
+        if account.hasUnusableQuotaWindow {
+            return .systemRed
+        }
+        if let remaining = account.lowestRemainingPercent {
             if remaining <= 15 { return .systemRed }
             if remaining <= 35 { return .systemOrange }
             return .systemGreen
@@ -1161,6 +1201,9 @@ final class QuotaBarView: NSView {
     var isMuted = false {
         didSet { needsDisplay = true }
     }
+    var isUnavailable = false {
+        didSet { needsDisplay = true }
+    }
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: 120, height: 6)
@@ -1182,6 +1225,7 @@ final class QuotaBarView: NSView {
     }
 
     private func barColor(for value: Double) -> NSColor {
+        if isUnavailable { return .systemRed }
         if value <= 15 { return .systemRed }
         if value <= 35 { return .systemOrange }
         return .systemGreen

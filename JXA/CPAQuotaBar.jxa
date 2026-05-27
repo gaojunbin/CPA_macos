@@ -16,6 +16,22 @@ var snapshot = null;
 var refreshing = false;
 var lastError = "";
 var started = false;
+var antigravityDefaultProjectID = "bamboo-precept-lgxtn";
+var antigravityModelURLs = [
+  "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+  "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+  "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+];
+var antigravityGroups = [
+  { id: "claude-gpt", label: "Claude/GPT", identifiers: ["claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"] },
+  { id: "gemini-3-pro", label: "Gemini 3 Pro", identifiers: ["gemini-3-pro-high", "gemini-3-pro-low"] },
+  { id: "gemini-3-1-pro-series", label: "Gemini 3.1 Pro Series", identifiers: ["gemini-3.1-pro-high", "gemini-3.1-pro-low"] },
+  { id: "gemini-2-5-flash", label: "Gemini 2.5 Flash", identifiers: ["gemini-2.5-flash", "gemini-2.5-flash-thinking"] },
+  { id: "gemini-2-5-flash-lite", label: "Gemini 2.5 Flash Lite", identifiers: ["gemini-2.5-flash-lite"] },
+  { id: "gemini-2-5-cu", label: "Gemini 2.5 CU", identifiers: ["rev19-uic3-1p"] },
+  { id: "gemini-3-flash", label: "Gemini 3 Flash", identifiers: ["gemini-3-flash"] },
+  { id: "gemini-image", label: "gemini-3.1-flash-image", identifiers: ["gemini-3.1-flash-image"], labelFromModel: true }
+];
 
 ObjC.registerSubclass({
   name: "CPAQuotaBarDelegate",
@@ -127,18 +143,34 @@ function updateMenu() {
     statusMenu.addItem($.NSMenuItem.separatorItem);
 
     if (snapshot.accounts.length === 0) {
-      addDisabledItem("No Codex accounts");
+      addDisabledItem("No monitored accounts");
     } else {
       snapshot.accounts.forEach(function (account) {
         var p5 = account.primaryRemaining;
         var p7 = account.weeklyRemaining;
         var dot = statusGlyph(account);
         var name = trimForMenu(account.name, 26);
-        var title = dot + "  " + padRight(name, 26) + "   " +
-          padLeft(formatPercent(p5), 5) + "   " +
-          padLeft(formatPercent(p7), 5);
+        var title = "";
+        if (account.quotaRows && account.quotaRows.length) {
+          title = dot + "  " + padRight(name, 26) + "   " +
+            padLeft(String(account.quotaRows.length), 2) + " quota rows";
+        } else {
+          title = dot + "  " + padRight(name, 26) + "   " +
+            padLeft(formatPercent(p5), 5) + "   " +
+            padLeft(formatPercent(p7), 5);
+        }
         if (account.plan) title += "   " + account.plan;
         addDisabledItem(title);
+        if (account.quotaRows && account.quotaRows.length) {
+          account.quotaRows.forEach(function (row) {
+            var value = row.displayValue || formatPercent(row.remaining);
+            var amount = row.amount ? "   " + padRight(trimForMenu(row.amount, 16), 16) : "";
+            addDisabledItem("     " +
+              padRight(trimForMenu(row.label, 24), 24) + "   " +
+              padLeft(value, 5) + amount + "   " +
+              trimForMenu(row.resetLabel || "-", 11));
+          });
+        }
         if (account.error) addDisabledItem("     " + trimForMenu(account.error, 72));
       });
     }
@@ -251,7 +283,7 @@ function refreshQuotas(showErrors) {
 
   try {
     var authFiles = fetchAuthFiles().filter(function (auth) {
-      return auth.isCodexLike;
+      return auth.isCodexLike || auth.isAntigravity || auth.isClaude || auth.isKimi || auth.isXAI;
     });
     var accounts = authFiles.map(function (auth) {
       return fetchAccountQuota(auth);
@@ -274,6 +306,11 @@ function fetchAuthFiles() {
 }
 
 function fetchAccountQuota(auth) {
+  if (auth.isAntigravity) return fetchAntigravityQuota(auth);
+  if (auth.isClaude) return fetchClaudeQuota(auth);
+  if (auth.isKimi) return fetchKimiQuota(auth);
+  if (auth.isXAI) return fetchXAIQuota(auth);
+
   if (!auth.authIndex) {
     auth.error = "missing auth_index";
     return auth;
@@ -315,6 +352,140 @@ function fetchAccountQuota(auth) {
   return auth;
 }
 
+function apiCallEnvelope(auth, method, url, headers, data) {
+  var payload = {
+    auth_index: auth.authIndex,
+    method: method,
+    url: url,
+    header: headers || {}
+  };
+  if (data !== undefined && data !== null) payload.data = data;
+  var raw = curlJSON("POST", managementURL("/v0/management/api-call"), JSON.stringify(payload));
+  var envelope = JSON.parse(raw || "{}");
+  var status = Number(envelope.status_code || envelope.statusCode || 0);
+  var body = typeof envelope.body === "string" ? envelope.body : JSON.stringify(envelope.body || {});
+  if (status < 200 || status >= 300) throw new Error(body || ("HTTP " + status));
+  return body;
+}
+
+function fetchAntigravityQuota(auth) {
+  if (!auth.authIndex) {
+    auth.error = "missing auth_index";
+    return auth;
+  }
+  if (auth.disabled) {
+    auth.error = "";
+    return auth;
+  }
+
+  try {
+    var projectID = auth.projectID || antigravityDefaultProjectID;
+    var usage = null;
+    var lastBody = "";
+    for (var i = 0; i < antigravityModelURLs.length; i++) {
+      var payload = {
+        auth_index: auth.authIndex,
+        method: "POST",
+        url: antigravityModelURLs[i],
+        header: {
+          "Authorization": "Bearer $TOKEN$",
+          "Content-Type": "application/json",
+          "User-Agent": "antigravity/1.21.9 darwin/arm64"
+        },
+        data: JSON.stringify({ project: projectID })
+      };
+      var raw = curlJSON("POST", managementURL("/v0/management/api-call"), JSON.stringify(payload));
+      var envelope = JSON.parse(raw || "{}");
+      var status = Number(envelope.status_code || envelope.statusCode || 0);
+      var body = typeof envelope.body === "string" ? envelope.body : JSON.stringify(envelope.body || {});
+      if (status < 200 || status >= 300) {
+        lastBody = body;
+        continue;
+      }
+      usage = parseAntigravityUsage(body);
+      if (usage.quotaRows.length) break;
+    }
+    if (!usage) throw new Error(lastBody || "Antigravity quota unavailable");
+    auth.quotaRows = usage.quotaRows;
+    auth.error = "";
+  } catch (error) {
+    auth.error = String(error);
+  }
+  return auth;
+}
+
+function fetchClaudeQuota(auth) {
+  if (!auth.authIndex) {
+    auth.error = "missing auth_index";
+    return auth;
+  }
+  if (auth.disabled) {
+    auth.error = "";
+    return auth;
+  }
+  var headers = {
+    "Authorization": "Bearer $TOKEN$",
+    "Content-Type": "application/json",
+    "anthropic-beta": "oauth-2025-04-20"
+  };
+  try {
+    var usage = apiCallEnvelope(auth, "GET", "https://api.anthropic.com/api/oauth/usage", headers, null);
+    var profile = "{}";
+    try {
+      profile = apiCallEnvelope(auth, "GET", "https://api.anthropic.com/api/oauth/profile", headers, null);
+    } catch (_) {}
+    var parsed = parseClaudeUsage(usage, profile);
+    auth.quotaRows = parsed.quotaRows;
+    auth.plan = parsed.plan || auth.plan;
+    auth.error = "";
+  } catch (error) {
+    auth.error = String(error);
+  }
+  return auth;
+}
+
+function fetchKimiQuota(auth) {
+  if (!auth.authIndex) {
+    auth.error = "missing auth_index";
+    return auth;
+  }
+  if (auth.disabled) {
+    auth.error = "";
+    return auth;
+  }
+  try {
+    var body = apiCallEnvelope(auth, "GET", "https://api.kimi.com/coding/v1/usages", {
+      "Authorization": "Bearer $TOKEN$"
+    }, null);
+    auth.quotaRows = parseKimiUsage(body).quotaRows;
+    auth.error = "";
+  } catch (error) {
+    auth.error = String(error);
+  }
+  return auth;
+}
+
+function fetchXAIQuota(auth) {
+  if (!auth.authIndex) {
+    auth.error = "missing auth_index";
+    return auth;
+  }
+  if (auth.disabled) {
+    auth.error = "";
+    return auth;
+  }
+  try {
+    var body = apiCallEnvelope(auth, "GET", "https://cli-chat-proxy.grok.com/v1/billing", {
+      "Authorization": "Bearer $TOKEN$"
+    }, null);
+    auth.quotaRows = parseXAIUsage(body).quotaRows;
+    auth.error = "";
+  } catch (error) {
+    auth.error = String(error);
+  }
+  return auth;
+}
+
 function curlJSON(method, url, body) {
   var command = "/usr/bin/curl -sS --fail-with-body --max-time 45 " +
     "-X " + shellQuote(method) + " " +
@@ -337,13 +508,24 @@ function normalizeAuthFile(file) {
     authIndex: clean(file.auth_index || file.authIndex || ""),
     provider: provider,
     isCodexLike: provider === "codex" || provider.indexOf("openai") >= 0,
+    isAntigravity: provider === "antigravity",
+    isClaude: provider === "claude" || provider === "anthropic",
+    isKimi: provider === "kimi",
+    isXAI: provider === "xai" || provider === "x-ai" || provider === "grok",
     accountID: clean(idToken.chatgpt_account_id || file.chatgpt_account_id || file.account_id || ""),
     plan: clean(idToken.plan_type || file.plan_type || file.plan || ""),
+    projectID: clean(file.project_id || file.projectId || ""),
     disabled: !!file.disabled || String(file.status || "").toLowerCase() === "disabled",
     primaryRemaining: null,
     weeklyRemaining: null,
     primaryReset: null,
     weeklyReset: null,
+    balanceValue: null,
+    balanceProgress: null,
+    balanceLabel: "",
+    balanceDetail: "",
+    balanceUsable: null,
+    quotaRows: [],
     error: ""
   };
 }
@@ -364,18 +546,252 @@ function parseUsage(body) {
   };
 }
 
+function parseAntigravityUsage(body) {
+  var payload = JSON.parse(body || "{}");
+  var models = payload.models || payload.modelQuotas || payload.model_quotas || {};
+  if (!models || typeof models !== "object" || Array.isArray(models)) {
+    throw new Error("quota payload missing models");
+  }
+  return { quotaRows: buildAntigravityRows(models) };
+}
+
+function parseClaudeUsage(usageBody, profileBody) {
+  var payload = JSON.parse(usageBody || "{}");
+  var profile = JSON.parse(profileBody || "{}");
+  var defs = [
+    ["five_hour", "5 小时限额"],
+    ["seven_day", "7 天限额"],
+    ["seven_day_oauth_apps", "7 天 OAuth 应用"],
+    ["seven_day_opus", "7 天 Opus"],
+    ["seven_day_sonnet", "7 天 Sonnet"],
+    ["seven_day_cowork", "7 天 Cowork"],
+    ["iguana_necktie", "Iguana Necktie"]
+  ];
+  var rows = [];
+  defs.forEach(function (def) {
+    var raw = payload[def[0]];
+    if (!raw || typeof raw !== "object" || raw.utilization === undefined) return;
+    var used = numberOrNull(raw.utilization);
+    var remaining = used === null ? null : Math.max(0, Math.min(100, 100 - used));
+    rows.push({
+      label: def[1],
+      remaining: remaining,
+      displayValue: formatPercent(remaining),
+      resetLabel: formatResetTime(raw.resets_at || raw.resetsAt || "")
+    });
+  });
+  var extra = payload.extra_usage || payload.extraUsage || null;
+  if (extra && (extra.is_enabled || extra.isEnabled)) {
+    rows.push({
+      label: "额外用量",
+      remaining: null,
+      displayValue: "--",
+      amount: moneyPair(
+        extra.used_credits !== undefined ? extra.used_credits : extra.usedCredits,
+        extra.monthly_limit !== undefined ? extra.monthly_limit : extra.monthlyLimit
+      ),
+      resetLabel: "-"
+    });
+  }
+  return { quotaRows: rows, plan: claudePlan(profile) };
+}
+
+function parseKimiUsage(body) {
+  var payload = JSON.parse(body || "{}");
+  var rows = [];
+  if (payload.usage && typeof payload.usage === "object") {
+    var summary = kimiRow(payload.usage, "周限额");
+    if (summary) rows.push(summary);
+  }
+  var limits = Array.isArray(payload.limits) ? payload.limits : [];
+  limits.forEach(function (item, index) {
+    var raw = item && typeof item.detail === "object" ? item.detail : item;
+    if (!raw || typeof raw !== "object") return;
+    var row = kimiRow(raw, kimiLimitLabel(item || {}, raw, index));
+    if (row) rows.push(row);
+  });
+  return { quotaRows: rows };
+}
+
+function parseXAIUsage(body) {
+  var payload = JSON.parse(body || "{}");
+  var config = payload.config || {};
+  var limit = centsValue(config.monthlyLimit !== undefined ? config.monthlyLimit : config.monthly_limit);
+  var used = centsValue(config.used);
+  var cap = centsValue(config.onDemandCap !== undefined ? config.onDemandCap : config.on_demand_cap);
+  var rows = [{
+    label: "按量付费",
+    remaining: null,
+    displayValue: cap > 0 ? "已启用" : "未启用",
+    amount: cap > 0 ? "封顶 " + money(cap) : "",
+    resetLabel: "-"
+  }];
+  var remaining = null;
+  if (limit > 0 && used !== null) remaining = Math.max(0, Math.min(100, 100 - used / limit * 100));
+  rows.push({
+    label: "月度积分",
+    remaining: remaining,
+    displayValue: formatPercent(remaining),
+    amount: moneyPair(used, limit),
+    resetLabel: formatResetTime(config.billingPeriodEnd || config.billing_period_end || "")
+  });
+  return { quotaRows: rows };
+}
+
+function claudePlan(profile) {
+  var account = profile.account || {};
+  if (account.has_claude_max) return "Max";
+  if (account.has_claude_pro) return "专业版";
+  var organization = profile.organization || {};
+  if (String(organization.organization_type || "").toLowerCase() === "claude_team" &&
+      String(organization.subscription_status || "").toLowerCase() === "active") {
+    return "团队版";
+  }
+  if (account.has_claude_max === false && account.has_claude_pro === false) return "免费版";
+  return "";
+}
+
+function kimiRow(raw, fallbackLabel) {
+  var limit = integerOrNull(raw.limit);
+  var used = integerOrNull(raw.used);
+  if (used === null && limit !== null) {
+    var remainingAmount = integerOrNull(raw.remaining);
+    if (remainingAmount !== null) used = Math.max(0, limit - remainingAmount);
+  }
+  if (used === null && limit === null) return null;
+  var remaining = null;
+  if (limit > 0) remaining = Math.max(0, Math.min(100, (limit - (used || 0)) / limit * 100));
+  else if ((used || 0) > 0) remaining = 0;
+  return {
+    label: clean(raw.name || raw.title || raw.scope || fallbackLabel),
+    remaining: remaining,
+    displayValue: formatPercent(remaining),
+    amount: limit > 0 ? String(used || 0) + " / " + String(limit) : "",
+    resetLabel: kimiResetHint(raw)
+  };
+}
+
+function kimiLimitLabel(item, raw, index) {
+  var named = clean(item.name || item.title || item.scope || raw.name || raw.title || raw.scope || "");
+  if (named) return named;
+  var window = item.window || {};
+  var duration = integerOrNull(window.duration || item.duration || raw.duration);
+  var unit = clean(window.timeUnit || window.time_unit || item.timeUnit || raw.timeUnit).toUpperCase();
+  if (duration && duration > 0) return kimiDuration(duration, unit) + " 限额";
+  return "限额 #" + (index + 1);
+}
+
+function kimiDuration(duration, unit) {
+  if (unit === "MINUTES") return duration % 60 === 0 ? String(duration / 60) + "h" : String(duration) + "m";
+  if (unit === "HOURS") return String(duration) + "h";
+  if (unit === "DAYS") return String(duration) + "d";
+  return String(duration) + "s";
+}
+
+function kimiResetHint(raw) {
+  var keys = ["reset_at", "resetAt", "reset_time", "resetTime"];
+  for (var i = 0; i < keys.length; i++) {
+    var value = raw[keys[i]];
+    if (!value) continue;
+    var date = new Date(value);
+    if (Number.isFinite(date.getTime())) return durationLabel((date.getTime() - Date.now()) / 1000) + " 后重置";
+  }
+  var seconds = numberOrNull(raw.reset_in || raw.resetIn || raw.ttl);
+  return seconds && seconds > 0 ? durationLabel(seconds) + " 后重置" : "-";
+}
+
+function buildAntigravityRows(models) {
+  var rows = [];
+  var byID = {};
+  antigravityGroups.forEach(function (group) { byID[group.id] = group; });
+
+  function append(id, resetOverride) {
+    var group = byID[id];
+    if (!group) return null;
+    var parsed = parseAntigravityGroup(group, models, resetOverride);
+    if (parsed) rows.push(parsed.row);
+    return parsed;
+  }
+
+  append("claude-gpt");
+  var gemini31Pro = append("gemini-3-1-pro-series");
+  var gemini3Pro = append("gemini-3-pro");
+  var imageReset = (gemini31Pro && gemini31Pro.resetTime) || (gemini3Pro && gemini3Pro.resetTime) || null;
+  append("gemini-2-5-flash");
+  append("gemini-2-5-flash-lite");
+  append("gemini-2-5-cu");
+  append("gemini-3-flash");
+  append("gemini-image", imageReset);
+  return rows;
+}
+
+function parseAntigravityGroup(group, models, resetOverride) {
+  var entries = [];
+  group.identifiers.forEach(function (identifier) {
+    var match = antigravityModelEntry(models, identifier);
+    if (!match) return;
+    var quota = match.entry.quotaInfo || match.entry.quota_info || {};
+    var remaining = fractionOrNull(quota.remainingFraction !== undefined ? quota.remainingFraction :
+      (quota.remaining_fraction !== undefined ? quota.remaining_fraction : quota.remaining));
+    var resetTime = clean(quota.resetTime || quota.reset_time || "");
+    if (remaining === null && resetTime) remaining = 0;
+    if (remaining === null) return;
+    entries.push({
+      id: match.id,
+      remaining: Math.max(0, Math.min(1, remaining)),
+      resetTime: resetTime,
+      displayName: clean(match.entry.displayName || match.entry.display_name || "")
+    });
+  });
+  if (!entries.length) return null;
+  var remainingFraction = Math.min.apply(null, entries.map(function (item) { return item.remaining; }));
+  var resetTime = resetOverride || entries.map(function (item) { return item.resetTime; }).filter(Boolean)[0] || "";
+  var displayName = entries.map(function (item) { return item.displayName; }).filter(Boolean)[0] || "";
+  var label = group.labelFromModel && displayName ? displayName : group.label;
+  return {
+    resetTime: resetTime,
+    row: {
+      id: group.id,
+      label: label,
+      remaining: Math.round(remainingFraction * 100),
+      resetLabel: formatResetTime(resetTime)
+    }
+  };
+}
+
+function antigravityModelEntry(models, identifier) {
+  if (models[identifier] && typeof models[identifier] === "object") {
+    return { id: identifier, entry: models[identifier] };
+  }
+  var keys = Object.keys(models);
+  var target = identifier.toLowerCase();
+  for (var i = 0; i < keys.length; i++) {
+    var entry = models[keys[i]];
+    if (!entry || typeof entry !== "object") continue;
+    var displayName = clean(entry.displayName || entry.display_name || "").toLowerCase();
+    if (displayName === target) return { id: keys[i], entry: entry };
+  }
+  return null;
+}
+
 function findRateLimit(value) {
+  var found = findObjectByName(value, "rate_limit");
+  if (found) return found;
+  return findObjectByName(value, "rateLimit");
+}
+
+function findObjectByName(value, target) {
   if (!value || typeof value !== "object") return null;
-  if (value.rate_limit || value.rateLimit) return value.rate_limit || value.rateLimit;
+  if (value[target] && typeof value[target] === "object") return value[target];
   if (Array.isArray(value)) {
     for (var i = 0; i < value.length; i++) {
-      var arrayFound = findRateLimit(value[i]);
+      var arrayFound = findObjectByName(value[i], target);
       if (arrayFound) return arrayFound;
     }
   } else {
     var keys = Object.keys(value);
     for (var j = 0; j < keys.length; j++) {
-      var found = findRateLimit(value[keys[j]]);
+      var found = findObjectByName(value[keys[j]], target);
       if (found) return found;
     }
   }
@@ -404,6 +820,27 @@ function remainingPercent(window, rate) {
   return Math.max(0, Math.min(100, 100 - used));
 }
 
+function antigravityBalanceProgress(amount, minimum) {
+  if (!isNumber(amount)) return null;
+  if (!isNumber(minimum) || minimum <= 0) return amount > 0 ? 100 : 0;
+  return Math.max(0, Math.min(100, (amount / minimum) * 100));
+}
+
+function antigravityBalanceUsable(amount, minimum) {
+  if (!isNumber(amount)) return null;
+  if (!isNumber(minimum) || minimum <= 0) return amount > 0;
+  return amount >= minimum;
+}
+
+function formatResetTime(value) {
+  if (!value) return "-";
+  var date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "-";
+  function two(n) { return n < 10 ? "0" + n : String(n); }
+  return two(date.getMonth() + 1) + "-" + two(date.getDate()) + " " +
+    two(date.getHours()) + ":" + two(date.getMinutes());
+}
+
 function resetSeconds(window) {
   if (!window) return null;
   var seconds = numberOrNull(window.reset_after_seconds !== undefined ? window.reset_after_seconds : window.resetAfterSeconds);
@@ -416,11 +853,14 @@ function resetSeconds(window) {
 function buildSnapshot(accounts) {
   var primaryValues = accounts.map(function (a) { return a.primaryRemaining; }).filter(isNumber);
   var weeklyValues = accounts.map(function (a) { return a.weeklyRemaining; }).filter(isNumber);
+  var quotaAccounts = accounts.filter(function (account) {
+    return isNumber(account.primaryRemaining) || (account.quotaRows && account.quotaRows.length > 0);
+  }).length;
   var now = new Date();
   return {
     accounts: accounts.sort(function (a, b) { return a.name.localeCompare(b.name); }),
     totalAccounts: accounts.length,
-    quotaAccounts: primaryValues.length,
+    quotaAccounts: quotaAccounts,
     primaryAverage: average(primaryValues),
     weeklyAverage: average(weeklyValues),
     updatedAt: now,
@@ -534,6 +974,53 @@ function numberOrNull(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function integerOrNull(value) {
+  var number = numberOrNull(value);
+  return number === null ? null : Math.floor(number);
+}
+
+function fractionOrNull(value) {
+  var number = numberOrNull(value);
+  if (number !== null) return number;
+  var text = clean(value);
+  if (text.slice(-1) === "%") {
+    var percent = numberOrNull(text.slice(0, -1));
+    if (percent !== null) return percent / 100;
+  }
+  return null;
+}
+
+function centsValue(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return numberOrNull(value.val);
+  }
+  return numberOrNull(value);
+}
+
+function money(cents) {
+  return isNumber(cents) ? "$" + (cents / 100).toFixed(2) : "--";
+}
+
+function moneyPair(used, limit) {
+  var usedCents = centsValue(used);
+  var limitCents = centsValue(limit);
+  if (usedCents === null && limitCents === null) return "";
+  if (limitCents === null) return money(usedCents);
+  return money(usedCents) + " / " + money(limitCents);
+}
+
+function durationLabel(seconds) {
+  if (!isNumber(seconds) || seconds <= 0) return "now";
+  var minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return String(minutes) + "m";
+  var hours = Math.floor(minutes / 60);
+  var rem = minutes % 60;
+  if (hours < 24) return rem ? String(hours) + "h " + String(rem) + "m" : String(hours) + "h";
+  var days = Math.floor(hours / 24);
+  var remHours = hours % 24;
+  return remHours ? String(days) + "d " + String(remHours) + "h" : String(days) + "d";
+}
+
 function isNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -550,9 +1037,32 @@ function formatPercent(value) {
   return Math.round(Math.max(0, value)) + "%";
 }
 
+function formatCredits(value) {
+  if (!isNumber(value)) return "--";
+  var amount = Math.max(0, value);
+  if (amount >= 1000000) {
+    var millions = amount / 1000000;
+    return (millions >= 10 ? millions.toFixed(0) : millions.toFixed(1)) + "M";
+  }
+  if (amount >= 1000) {
+    var thousands = amount / 1000;
+    return (thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)) + "K";
+  }
+  if (Math.floor(amount) === amount) return amount.toFixed(0);
+  return amount < 10 ? amount.toFixed(1) : amount.toFixed(0);
+}
+
 function statusGlyph(account) {
   if (account.error) return "✕";
   if (account.disabled) return "—";
+  if (account.quotaRows && account.quotaRows.length) {
+    var values = account.quotaRows.map(function (row) { return row.remaining; }).filter(isNumber);
+    if (!values.length) return "●";
+    var lowest = Math.min.apply(null, values);
+    if (lowest <= 15) return "◯";
+    if (lowest <= 35) return "◐";
+    return "●";
+  }
   var p = account.primaryRemaining;
   if (!isNumber(p)) return "·";
   if (p <= 15) return "◯";

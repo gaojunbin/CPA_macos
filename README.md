@@ -1,12 +1,15 @@
 # CLIProxyAPI Pool Monitor
 
-Native macOS menu bar monitor for CLIProxyAPI Codex/OpenAI account pool quotas.
+Native macOS menu bar monitor for CLIProxyAPI Codex/OpenAI account pool quotas plus web-matched Claude, Antigravity, Kimi, and Grok quota rows.
 
 It reads the management API with the configured password, then refreshes each Codex account through:
 
 - `GET /v0/management/auth-files`
 - `POST /v0/management/api-call`
 - Upstream target `https://chatgpt.com/backend-api/wham/usage`
+
+Antigravity accounts are refreshed through the same management proxy with the web UI's `fetchAvailableModels` quota endpoint.
+Claude, Kimi, and Grok accounts use the same upstream quota endpoints and response shapes as the management web UI.
 
 CLIProxyAPI replaces `Bearer $TOKEN$` server-side, so the app never needs account tokens.
 

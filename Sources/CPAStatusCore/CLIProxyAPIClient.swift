@@ -24,6 +24,12 @@ public struct CLIProxyAPIClient: Sendable {
     public let settings: AppSettings
     public let timeout: TimeInterval
     private let session: URLSession
+    private static let antigravityDefaultProjectID = "bamboo-precept-lgxtn"
+    private static let antigravityModelURLs = [
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+        "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+        "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+    ]
 
     public init(settings: AppSettings, session: URLSession = .shared, timeout: TimeInterval = 45) {
         self.settings = settings
@@ -145,22 +151,30 @@ public struct CLIProxyAPIClient: Sendable {
         }
 
         do {
-            let usage = try await fetchWhamUsage(auth: auth)
+            let usage = try await fetchUsage(auth: auth)
             return AccountQuota(auth: auth, usage: usage, errorMessage: nil)
         } catch {
             return AccountQuota(auth: auth, usage: nil, errorMessage: error.localizedDescription)
         }
     }
 
-    private func fetchWhamUsage(auth: AuthFile) async throws -> UsageSnapshot {
-        var request = URLRequest(
-            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/api-call"),
-            timeoutInterval: timeout
-        )
-        request.httpMethod = "POST"
-        applyManagementHeaders(to: &request)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    private func fetchUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        if auth.isAntigravity {
+            return try await fetchAntigravityUsage(auth: auth)
+        }
+        if auth.isClaude {
+            return try await fetchClaudeUsage(auth: auth)
+        }
+        if auth.isKimi {
+            return try await fetchKimiUsage(auth: auth)
+        }
+        if auth.isXAI {
+            return try await fetchXAIUsage(auth: auth)
+        }
+        return try await fetchWhamUsage(auth: auth)
+    }
 
+    private func fetchWhamUsage(auth: AuthFile) async throws -> UsageSnapshot {
         var headers = [
             "Authorization": "Bearer $TOKEN$",
             "Accept": "application/json",
@@ -178,21 +192,155 @@ public struct CLIProxyAPIClient: Sendable {
             header: headers,
             data: nil
         )
+        return try await fetchUsageViaAPICall(payload: payload)
+    }
+
+    private func fetchAntigravityUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        let projectID = await antigravityProjectID(for: auth)
+        let payloadBody = try jsonString(["project": projectID])
+        let headers = [
+            "Authorization": "Bearer $TOKEN$",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity/1.21.9 darwin/arm64"
+        ]
+
+        var lastError: Error?
+        var emptySnapshot: UsageSnapshot?
+        var sawSuccessfulResponse = false
+
+        for url in Self.antigravityModelURLs {
+            let payload = APICallRequest(
+                authIndex: auth.authIndex,
+                method: "POST",
+                url: url,
+                header: headers,
+                data: payloadBody
+            )
+
+            do {
+                let envelope = try await fetchAPICallEnvelope(payload: payload)
+                guard (200..<300).contains(envelope.statusCode) else {
+                    lastError = PoolClientError.httpStatus(envelope.statusCode, envelope.body)
+                    continue
+                }
+
+                sawSuccessfulResponse = true
+                if let snapshot = UsageParser.parse(envelope.body) {
+                    if snapshot.hasQuotaSignal {
+                        return snapshot
+                    }
+                    emptySnapshot = snapshot
+                } else {
+                    lastError = PoolClientError.invalidResponse("empty Antigravity model quota")
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        if sawSuccessfulResponse {
+            return emptySnapshot ?? UsageSnapshot(
+                planType: nil,
+                primary: nil,
+                weekly: nil,
+                rawStatus: "empty_models"
+            )
+        }
+
+        throw lastError ?? PoolClientError.invalidResponse("empty Antigravity model quota")
+    }
+
+    private func fetchClaudeUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        let headers = [
+            "Authorization": "Bearer $TOKEN$",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20"
+        ]
+        let usageEnvelope = try await fetchAPICallEnvelope(payload: APICallRequest(
+            authIndex: auth.authIndex,
+            method: "GET",
+            url: "https://api.anthropic.com/api/oauth/usage",
+            header: headers,
+            data: nil
+        ))
+        guard (200..<300).contains(usageEnvelope.statusCode) else {
+            throw PoolClientError.httpStatus(usageEnvelope.statusCode, usageEnvelope.body)
+        }
+
+        let profileEnvelope = try? await fetchAPICallEnvelope(payload: APICallRequest(
+            authIndex: auth.authIndex,
+            method: "GET",
+            url: "https://api.anthropic.com/api/oauth/profile",
+            header: headers,
+            data: nil
+        ))
+        let usageObject = Self.jsonObject(from: usageEnvelope.body) ?? [:]
+        let profileObject = profileEnvelope.flatMap { envelope -> [String: Any]? in
+            guard (200..<300).contains(envelope.statusCode) else {
+                return nil
+            }
+            return Self.jsonObject(from: envelope.body)
+        }
+        let body = try jsonString([
+            "_provider": "claude",
+            "usage": usageObject,
+            "profile": profileObject ?? [:]
+        ])
+        if let snapshot = UsageParser.parse(body) {
+            return snapshot
+        }
+        throw PoolClientError.invalidResponse("empty Claude quota")
+    }
+
+    private func fetchKimiUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        let payload = APICallRequest(
+            authIndex: auth.authIndex,
+            method: "GET",
+            url: "https://api.kimi.com/coding/v1/usages",
+            header: ["Authorization": "Bearer $TOKEN$"],
+            data: nil
+        )
+        return try await fetchUsageViaAPICall(payload: payload)
+    }
+
+    private func fetchXAIUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        let payload = APICallRequest(
+            authIndex: auth.authIndex,
+            method: "GET",
+            url: "https://cli-chat-proxy.grok.com/v1/billing",
+            header: ["Authorization": "Bearer $TOKEN$"],
+            data: nil
+        )
+        return try await fetchUsageViaAPICall(payload: payload)
+    }
+
+    private func fetchUsageViaAPICall(payload: APICallRequest) async throws -> UsageSnapshot {
+        let envelope = try await fetchAPICallEnvelope(payload: payload)
+        if (200..<300).contains(envelope.statusCode),
+           let snapshot = UsageParser.parse(envelope.body) {
+            return snapshot
+        }
+        if let snapshot = UsageParser.parse(envelope.body) {
+            return snapshot
+        }
+        throw PoolClientError.httpStatus(envelope.statusCode, envelope.body)
+    }
+
+    private func fetchAPICallEnvelope(payload: APICallRequest) async throws -> APICallEnvelope {
+        var request = URLRequest(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/api-call"),
+            timeoutInterval: timeout
+        )
+        request.httpMethod = "POST"
+        applyManagementHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(payload)
 
         var lastError: Error?
         for attempt in 1...2 {
             do {
                 let data = try await data(for: request)
-                let envelope = try decodeAPICallEnvelope(data)
-                if (200..<300).contains(envelope.statusCode),
-                   let snapshot = UsageParser.parse(envelope.body) {
-                    return snapshot
-                }
-                if let snapshot = UsageParser.parse(envelope.body) {
-                    return snapshot
-                }
-                throw PoolClientError.httpStatus(envelope.statusCode, envelope.body)
+                return try decodeAPICallEnvelope(data)
             } catch {
                 lastError = error
                 if attempt == 2 || !shouldRetry(error: error) {
@@ -202,6 +350,72 @@ public struct CLIProxyAPIClient: Sendable {
             }
         }
         throw lastError ?? PoolClientError.invalidResponse("empty quota response")
+    }
+
+    private func antigravityProjectID(for auth: AuthFile) async -> String {
+        if let projectID = auth.projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !projectID.isEmpty {
+            return projectID
+        }
+        if let body = try? await downloadAuthFile(named: auth.name),
+           let projectID = Self.projectID(fromAuthFileBody: body) {
+            return projectID
+        }
+        return Self.antigravityDefaultProjectID
+    }
+
+    private func downloadAuthFile(named name: String) async throws -> String {
+        var components = URLComponents(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/download"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "name", value: name)]
+        guard let url = components?.url else {
+            throw PoolClientError.invalidResponse("invalid auth-file download URL")
+        }
+
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private static func projectID(fromAuthFileBody body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return firstNonEmpty(
+            firstString(root["project_id"]),
+            firstString(root["projectId"]),
+            firstString(nested(root, "installed", "project_id")),
+            firstString(nested(root, "installed", "projectId")),
+            firstString(nested(root, "web", "project_id")),
+            firstString(nested(root, "web", "projectId"))
+        )
+    }
+
+    private static func jsonObject(from body: String) -> [String: Any]? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return object
+    }
+
+    private func jsonString(_ object: [String: String]) throws -> String {
+        try jsonString(object as [String: Any])
+    }
+
+    private func jsonString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw PoolClientError.invalidResponse("failed to encode JSON payload")
+        }
+        return string
     }
 
     private func data(for request: URLRequest) async throws -> Data {
