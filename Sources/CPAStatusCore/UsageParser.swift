@@ -155,14 +155,14 @@ public enum UsageParser {
 
     private static func parseGeneric(_ json: Any, now: Date) -> UsageSnapshot? {
         let pairs = flatten(json)
-        let used = firstNumber(in: pairs, matching: [
+        let used = firstNumberInPairs(pairs, matching: [
             "used_percent", "usedpercent", "usage_percent", "usagepercent"
         ])
-        let resetSeconds = firstNumber(in: pairs, matching: [
+        let resetSeconds = firstNumberInPairs(pairs, matching: [
             "reset_after_seconds", "resetafterseconds", "retry_after", "retryafter"
         ])
-        let resetAtRaw = firstNumber(in: pairs, matching: ["reset_at", "resetat", "reset_time", "resettime"])
-        let status = firstString(in: pairs, matching: ["status", "code", "message", "error"])
+        let resetAtRaw = firstNumberInPairs(pairs, matching: ["reset_at", "resetat", "reset_time", "resettime"])
+        let status = firstStringInPairs(pairs, matching: ["status", "code", "message", "error"])
         let lowerStatus = status?.lowercased() ?? ""
         let limitSignal = ["rate limit", "quota", "usage limit", "insufficient_quota", "limit_reached"].contains { lowerStatus.contains($0) }
 
@@ -185,7 +185,7 @@ public enum UsageParser {
             resetAt: resetAtRaw.flatMap { dateValue($0, now: now) }
         )
         return UsageSnapshot(
-            planType: firstString(in: pairs, matching: ["plan_type", "plantype", "plan"]),
+            planType: firstStringInPairs(pairs, matching: ["plan_type", "plantype", "plan"]),
             primary: window,
             weekly: nil,
             rawStatus: status,
@@ -207,7 +207,7 @@ public enum UsageParser {
         return [(path.lowercased(), value)]
     }
 
-    private static func firstNumber(in pairs: [(String, Any)], matching keys: [String]) -> Double? {
+    private static func firstNumberInPairs(_ pairs: [(String, Any)], matching keys: [String]) -> Double? {
         for key in keys {
             if let match = pairs.first(where: { path, _ in pathComponent(path, matches: key) }),
                let number = numberValue(match.1) {
@@ -217,7 +217,7 @@ public enum UsageParser {
         return nil
     }
 
-    private static func firstString(in pairs: [(String, Any)], matching keys: [String]) -> String? {
+    private static func firstStringInPairs(_ pairs: [(String, Any)], matching keys: [String]) -> String? {
         for key in keys {
             if let match = pairs.first(where: { path, _ in pathComponent(path, matches: key) }),
                let string = firstString(match.1) {

@@ -76,13 +76,13 @@ function startApp() {
 function setupStatusBar() {
   statusItem = $.NSStatusBar.systemStatusBar.statusItemWithLength($.NSVariableStatusItemLength);
   var button = statusItem.button;
-  button.title = " CPA";
+  button.title = "";
   var image = $.NSImage.imageWithSystemSymbolNameAccessibilityDescription("gauge.with.dots.needle.50percent", "CLIProxyAPI quota");
   if (image) {
     button.image = image;
     button.imagePosition = $.NSImageLeft;
   }
-  statusMenu = $.NSMenu.alloc.initWithTitle("CPA Quota");
+  statusMenu = $.NSMenu.alloc.initWithTitle("Pool");
   statusItem.menu = statusMenu;
   updateMenu();
 }
@@ -90,14 +90,18 @@ function setupStatusBar() {
 function updateStatusTitle() {
   if (!statusItem) return;
   var button = statusItem.button;
-  if (refreshing) {
-    button.title = " ...";
-  } else if (lastError) {
-    button.title = " !";
+  if (!isConfigured()) {
+    button.title = "";
+    return;
+  }
+  if (refreshing && !snapshot) {
+    button.title = "  ⋯";
+  } else if (lastError && !snapshot) {
+    button.title = "  !";
   } else if (snapshot && typeof snapshot.primaryAverage === "number") {
-    button.title = " " + formatPercent(snapshot.primaryAverage);
+    button.title = "  " + formatPercent(snapshot.primaryAverage);
   } else {
-    button.title = " CPA";
+    button.title = "";
   }
 }
 
@@ -105,45 +109,50 @@ function updateMenu() {
   if (!statusMenu) return;
   statusMenu.removeAllItems;
 
-  addDisabledItem("CLIProxyAPI Pool Monitor");
-  addDisabledItem(isConfigured() ? normalizedBaseURL() : "Not configured");
-  statusMenu.addItem($.NSMenuItem.separatorItem);
-
-  if (lastError) {
-    addDisabledItem("Error: " + trimForMenu(lastError, 64));
-    statusMenu.addItem($.NSMenuItem.separatorItem);
+  if (snapshot) {
+    snapshot.relativeUpdate = relativeUpdateString(snapshot.updatedAt);
   }
 
   if (!isConfigured()) {
-    addDisabledItem("Configure endpoint and password first.");
+    addDisabledItem("Not configured");
+    statusMenu.addItem($.NSMenuItem.separatorItem);
+    addDisabledItem("Open Settings to connect.");
+  } else if (lastError && !snapshot) {
+    addDisabledItem(trimForMenu(lastError, 72));
   } else if (snapshot) {
-    addDisabledItem("Updated: " + snapshot.updatedAt);
-    addDisabledItem("Accounts: " + snapshot.quotaAccounts + "/" + snapshot.totalAccounts +
-      "  5h avg: " + formatPercent(snapshot.primaryAverage) +
-      "  7d avg: " + formatPercent(snapshot.weeklyAverage));
+    addDisabledItem(formatPercent(snapshot.primaryAverage) + " · 5h    " +
+      formatPercent(snapshot.weeklyAverage) + " · 7d    " +
+      snapshot.quotaAccounts + "/" + snapshot.totalAccounts + " accts");
+    addDisabledItem("Updated " + snapshot.relativeUpdate);
     statusMenu.addItem($.NSMenuItem.separatorItem);
 
     if (snapshot.accounts.length === 0) {
-      addDisabledItem("No Codex/OpenAI accounts returned.");
+      addDisabledItem("No Codex accounts");
     } else {
       snapshot.accounts.forEach(function (account) {
         var p5 = account.primaryRemaining;
         var p7 = account.weeklyRemaining;
-        var title = bar(p5) + " " + trimForMenu(account.name, 28) +
-          "  5h " + formatPercent(p5) +
-          "  7d " + formatPercent(p7);
-        if (account.plan) title += "  " + account.plan;
+        var dot = statusGlyph(account);
+        var name = trimForMenu(account.name, 26);
+        var title = dot + "  " + padRight(name, 26) + "   " +
+          padLeft(formatPercent(p5), 5) + "   " +
+          padLeft(formatPercent(p7), 5);
+        if (account.plan) title += "   " + account.plan;
         addDisabledItem(title);
-        if (account.error) addDisabledItem("  " + trimForMenu(account.error, 72));
+        if (account.error) addDisabledItem("     " + trimForMenu(account.error, 72));
       });
     }
+    if (lastError) {
+      statusMenu.addItem($.NSMenuItem.separatorItem);
+      addDisabledItem(trimForMenu(lastError, 72));
+    }
   } else {
-    addDisabledItem(refreshing ? "Refreshing live quota..." : "No quota data yet.");
+    addDisabledItem(refreshing ? "Refreshing…" : "No data");
   }
 
   statusMenu.addItem($.NSMenuItem.separatorItem);
-  addActionItem(refreshing ? "Refreshing..." : "Refresh Now", "refresh:", !refreshing && isConfigured());
-  addActionItem("Settings", "settings:", true);
+  addActionItem(refreshing ? "Refreshing…" : "Refresh", "refresh:", !refreshing && isConfigured());
+  addActionItem("Settings…", "settings:", true);
   addActionItem("Quit", "quit:", true);
   updateStatusTitle();
 }
@@ -163,9 +172,9 @@ function addActionItem(title, actionName, enabled) {
 
 function showSettings() {
   var alert = $.NSAlert.alloc.init;
-  alert.messageText = "Configure CLIProxyAPI";
-  alert.informativeText = "Enter the deployed web endpoint and management password.";
-  alert.addButtonWithTitle("Save and Refresh");
+  alert.messageText = "CLIProxyAPI";
+  alert.informativeText = "Where to reach your pool.";
+  alert.addButtonWithTitle("Save");
   alert.addButtonWithTitle("Cancel");
 
   var stack = $.NSStackView.alloc.initWithFrame($.NSMakeRect(0, 0, 420, 190));
@@ -184,11 +193,11 @@ function showSettings() {
   intervalField.placeholderString = "5";
   intervalField.stringValue = String(Math.max(1, Math.round((settings.refreshIntervalSeconds || 300) / 60)));
 
-  stack.addArrangedSubview(labelField("Web endpoint"));
+  stack.addArrangedSubview(labelField("Endpoint"));
   stack.addArrangedSubview(urlField);
   stack.addArrangedSubview(labelField("Password"));
   stack.addArrangedSubview(keyField);
-  stack.addArrangedSubview(labelField("Refresh minutes"));
+  stack.addArrangedSubview(labelField("Refresh (minutes)"));
   stack.addArrangedSubview(intervalField);
   alert.accessoryView = stack;
 
@@ -407,13 +416,15 @@ function resetSeconds(window) {
 function buildSnapshot(accounts) {
   var primaryValues = accounts.map(function (a) { return a.primaryRemaining; }).filter(isNumber);
   var weeklyValues = accounts.map(function (a) { return a.weeklyRemaining; }).filter(isNumber);
+  var now = new Date();
   return {
     accounts: accounts.sort(function (a, b) { return a.name.localeCompare(b.name); }),
     totalAccounts: accounts.length,
     quotaAccounts: primaryValues.length,
     primaryAverage: average(primaryValues),
     weeklyAverage: average(weeklyValues),
-    updatedAt: timeString()
+    updatedAt: now,
+    relativeUpdate: "just now"
   };
 }
 
@@ -496,7 +507,7 @@ function saveKeychain(value) {
 
 function showError(message) {
   var alert = $.NSAlert.alloc.init;
-  alert.messageText = "Refresh failed";
+  alert.messageText = "Couldn’t refresh";
   alert.informativeText = String(message);
   alert.addButtonWithTitle("OK");
   nsApp.activateIgnoringOtherApps(true);
@@ -539,29 +550,40 @@ function formatPercent(value) {
   return Math.round(Math.max(0, value)) + "%";
 }
 
-function bar(value) {
-  if (!isNumber(value)) return "[----------]";
-  var filled = Math.round(Math.max(0, Math.min(100, value)) / 10);
-  return "[" + repeat("#", filled) + repeat("-", 10 - filled) + "]";
-}
-
-function repeat(text, count) {
-  var result = "";
-  for (var i = 0; i < count; i++) result += text;
-  return result;
+function statusGlyph(account) {
+  if (account.error) return "✕";
+  if (account.disabled) return "—";
+  var p = account.primaryRemaining;
+  if (!isNumber(p)) return "·";
+  if (p <= 15) return "◯";
+  if (p <= 35) return "◐";
+  return "●";
 }
 
 function trimForMenu(value, maxLength) {
   var text = String(value || "");
   if (text.length <= maxLength) return text;
-  return text.slice(0, Math.max(0, maxLength - 1)) + "...";
+  return text.slice(0, Math.max(0, maxLength - 1)) + "…";
 }
 
-function timeString() {
-  var date = new Date();
-  return pad2(date.getHours()) + ":" + pad2(date.getMinutes()) + ":" + pad2(date.getSeconds());
+function padRight(text, width) {
+  text = String(text || "");
+  while (text.length < width) text += " ";
+  return text;
 }
 
-function pad2(value) {
-  return value < 10 ? "0" + value : String(value);
+function padLeft(text, width) {
+  text = String(text || "");
+  while (text.length < width) text = " " + text;
+  return text;
+}
+
+function relativeUpdateString(date) {
+  if (!(date instanceof Date)) return "moments ago";
+  var diff = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (diff < 5) return "just now";
+  if (diff < 60) return diff + "s ago";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
 }

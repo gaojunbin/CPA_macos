@@ -249,15 +249,88 @@ public struct PoolSummary: Equatable, Sendable {
     }
 }
 
-public struct PoolSnapshot: Equatable, Sendable {
+public struct ProviderInfo: Equatable, Sendable {
+    public let key: String
+    public let displayName: String
+    public let symbolName: String
+    public let accentName: String
+    public let priority: Int
+    public let supportsUsage: Bool
+
+    public init(
+        key: String,
+        displayName: String,
+        symbolName: String,
+        accentName: String,
+        priority: Int,
+        supportsUsage: Bool
+    ) {
+        self.key = key
+        self.displayName = displayName
+        self.symbolName = symbolName
+        self.accentName = accentName
+        self.priority = priority
+        self.supportsUsage = supportsUsage
+    }
+}
+
+public enum ProviderCatalog {
+    private static let table: [String: ProviderInfo] = [
+        "codex": ProviderInfo(key: "codex", displayName: "Codex", symbolName: "chevron.left.forwardslash.chevron.right", accentName: "teal", priority: 0, supportsUsage: true),
+        "openai": ProviderInfo(key: "openai", displayName: "OpenAI", symbolName: "o.circle.fill", accentName: "mint", priority: 1, supportsUsage: true),
+        "claude": ProviderInfo(key: "claude", displayName: "Claude", symbolName: "c.circle.fill", accentName: "orange", priority: 2, supportsUsage: false),
+        "anthropic": ProviderInfo(key: "anthropic", displayName: "Claude", symbolName: "c.circle.fill", accentName: "orange", priority: 2, supportsUsage: false),
+        "gemini": ProviderInfo(key: "gemini", displayName: "Gemini", symbolName: "g.circle.fill", accentName: "blue", priority: 3, supportsUsage: false),
+        "gemini-cli": ProviderInfo(key: "gemini-cli", displayName: "Gemini CLI", symbolName: "g.circle", accentName: "blue", priority: 4, supportsUsage: false),
+        "vertex": ProviderInfo(key: "vertex", displayName: "Vertex AI", symbolName: "cloud.fill", accentName: "indigo", priority: 5, supportsUsage: false),
+        "antigravity": ProviderInfo(key: "antigravity", displayName: "Antigravity", symbolName: "paperplane.fill", accentName: "purple", priority: 6, supportsUsage: false),
+        "xai": ProviderInfo(key: "xai", displayName: "xAI", symbolName: "x.circle.fill", accentName: "gray", priority: 7, supportsUsage: false),
+        "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: false)
+    ]
+
+    public static func info(for rawKey: String) -> ProviderInfo {
+        let normalized = rawKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let exact = table[normalized] {
+            return exact
+        }
+        if normalized.contains("openai") {
+            return ProviderInfo(key: normalized, displayName: "OpenAI Compat", symbolName: "circle.hexagongrid.fill", accentName: "mint", priority: 50, supportsUsage: false)
+        }
+        let display = normalized.isEmpty
+            ? "Other"
+            : normalized.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+        return ProviderInfo(key: normalized.isEmpty ? "other" : normalized, displayName: display, symbolName: "circle.dotted", accentName: "gray", priority: 200, supportsUsage: false)
+    }
+}
+
+public struct ProviderPool: Identifiable, Equatable, Sendable {
+    public let provider: ProviderInfo
     public let accounts: [AccountQuota]
+    public let summary: PoolSummary
+
+    public var id: String { provider.key }
+
+    public init(provider: ProviderInfo, accounts: [AccountQuota], fetchedAt: Date = Date()) {
+        self.provider = provider
+        self.accounts = accounts
+        self.summary = PoolSummary(accounts: accounts, fetchedAt: fetchedAt)
+    }
+}
+
+public struct PoolSnapshot: Equatable, Sendable {
+    public let providers: [ProviderPool]
     public let summary: PoolSummary
     public let fetchedAt: Date
 
-    public init(accounts: [AccountQuota], fetchedAt: Date = Date()) {
-        self.accounts = accounts
-        self.summary = PoolSummary(accounts: accounts, fetchedAt: fetchedAt)
+    public init(providers: [ProviderPool], fetchedAt: Date = Date()) {
+        self.providers = providers
+        let allAccounts = providers.flatMap(\.accounts)
+        self.summary = PoolSummary(accounts: allAccounts, fetchedAt: fetchedAt)
         self.fetchedAt = fetchedAt
+    }
+
+    public var accounts: [AccountQuota] {
+        providers.flatMap(\.accounts)
     }
 }
 

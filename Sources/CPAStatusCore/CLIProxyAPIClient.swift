@@ -32,11 +32,37 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     public func fetchPoolSnapshot() async throws -> PoolSnapshot {
-        let authFiles = try await fetchAuthFiles()
-            .filter(\.isCodexLike)
-            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-        let accounts = await fetchAccountQuotas(authFiles)
-        return PoolSnapshot(accounts: accounts, fetchedAt: Date())
+        let allAuthFiles = try await fetchAuthFiles()
+        let now = Date()
+
+        let grouped = Dictionary(grouping: allAuthFiles) { auth -> String in
+            let info = ProviderCatalog.info(for: auth.normalizedProvider)
+            return info.key
+        }
+
+        var pools: [ProviderPool] = []
+        for (providerKey, files) in grouped {
+            let providerInfo = ProviderCatalog.info(for: providerKey)
+            let sortedFiles = files.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+            let accounts: [AccountQuota]
+            if providerInfo.supportsUsage {
+                accounts = await fetchAccountQuotas(sortedFiles)
+            } else {
+                accounts = sortedFiles.map { AccountQuota(auth: $0, usage: nil, errorMessage: nil) }
+            }
+            pools.append(ProviderPool(provider: providerInfo, accounts: accounts, fetchedAt: now))
+        }
+
+        pools.sort { lhs, rhs in
+            if lhs.provider.priority != rhs.provider.priority {
+                return lhs.provider.priority < rhs.provider.priority
+            }
+            return lhs.provider.displayName.localizedCaseInsensitiveCompare(rhs.provider.displayName) == .orderedAscending
+        }
+
+        return PoolSnapshot(providers: pools, fetchedAt: now)
     }
 
     public func fetchAuthFiles() async throws -> [AuthFile] {
