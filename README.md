@@ -1,4 +1,4 @@
-# CLIProxyAPI Pool Monitor
+# CPA
 
 Native macOS menu bar monitor for CLIProxyAPI Codex/OpenAI account pool quotas plus web-matched Claude, Antigravity, Kimi, and Grok quota rows.
 
@@ -33,14 +33,14 @@ No Xcode is required for the default app bundle:
 
 ```bash
 Scripts/build_jxa_app.sh
-open "dist/CLIProxyAPI Pool Monitor.app"
+open "dist/CPA.app"
 ```
 
 There is also a native Swift/AppKit implementation. It requires the local Xcode/Command Line Tools license to be accepted:
 
 ```bash
 Scripts/build_app.sh
-open "dist/CLIProxyAPI Pool Monitor.app"
+open "dist/CPA.app"
 ```
 
 The app runs as a menu bar accessory and does not manage or modify the account pool.

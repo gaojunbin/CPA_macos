@@ -2,22 +2,30 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP_NAME="CLIProxyAPI Pool Monitor"
+APP_NAME="CPA"
 BUNDLE_ID="local.cpa.statusbar"
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
+ICON_FILE="$ROOT_DIR/Resources/AppIcon.icns"
+DIST_DIR="$ROOT_DIR/dist"
 
 cd "$ROOT_DIR"
 swift build -c "$BUILD_CONFIG" --product CPAStatusBar
 
 BINARY="$ROOT_DIR/.build/$BUILD_CONFIG/CPAStatusBar"
-APP_DIR="$ROOT_DIR/dist/$APP_NAME.app"
-CONTENTS="$APP_DIR/Contents"
+APP_DIR="$DIST_DIR/$APP_NAME.app"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+STAGE_APP="$TMP_DIR/$APP_NAME.app"
+CONTENTS="$STAGE_APP/Contents"
 MACOS="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
 
+mkdir -p "$DIST_DIR"
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS"
+mkdir -p "$MACOS" "$RESOURCES"
 cp "$BINARY" "$MACOS/$APP_NAME"
 chmod +x "$MACOS/$APP_NAME"
+cp "$ICON_FILE" "$RESOURCES/AppIcon.icns"
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +40,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <string>$APP_NAME</string>
   <key>CFBundleDisplayName</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -47,5 +57,12 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+ditto "$STAGE_APP" "$APP_DIR"
+if command -v xattr >/dev/null 2>&1; then
+  find "$APP_DIR" -exec xattr -d com.apple.FinderInfo {} + 2>/dev/null || true
+  find "$APP_DIR" -exec xattr -d com.apple.ResourceFork {} + 2>/dev/null || true
+  find "$APP_DIR" -exec xattr -d 'com.apple.fileprovider.fpfs#P' {} + 2>/dev/null || true
+fi
 
 echo "$APP_DIR"
