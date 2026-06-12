@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Artifact version, for example 1.0.0"
+        required: false
+        type: string
+      app_variant:
+        description: "App bundle implementation to package"
+        required: false
+        default: "jxa"
+        type: choice
+        options:
+          - jxa
+          - native
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package macOS app
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
+          APP_VARIANT: ${{ inputs.app_variant || 'jxa' }}
+        run: Scripts/package_github_release.sh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CPA-macOS
+          path: dist/github/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/github/* --clobber
+          else
+            gh release create "$TAG_NAME" dist/github/* --title "$TAG_NAME" --notes "CPA macOS release."
+          fi

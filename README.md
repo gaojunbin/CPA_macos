@@ -44,3 +44,27 @@ open "dist/CPA.app"
 ```
 
 The app runs as a menu bar accessory and does not manage or modify the account pool.
+
+## Package for GitHub Releases
+
+Create installable GitHub Release assets:
+
+```bash
+VERSION=1.0.0 Scripts/package_github_release.sh
+```
+
+The release files are written to `dist/github/`:
+
+- `CPA-1.0.0-macOS.dmg` for drag-to-Applications installation
+- `CPA-1.0.0-macOS.zip` as a fallback app bundle archive
+- `CPA-1.0.0-macOS-SHA256.txt` for checksum verification
+
+By default the package script uses the JXA app bundle because it does not require Xcode. To package the native Swift/AppKit bundle instead:
+
+```bash
+APP_VARIANT=native VERSION=1.0.0 Scripts/package_github_release.sh
+```
+
+Pushing a tag like `v1.0.0` runs the Release workflow and uploads the same assets to the GitHub Release.
+
+The local package is ad-hoc signed by default. For public distribution without Gatekeeper warnings, build with a Developer ID signing identity and notarize the release with Apple.
