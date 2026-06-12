@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="${APP_NAME:-CPA}"
-APP_VARIANT="${APP_VARIANT:-jxa}"
+APP_VARIANT="${APP_VARIANT:-native}"
 DIST_DIR="$ROOT_DIR/dist"
 OUTPUT_DIR="${OUTPUT_DIR:-$DIST_DIR/github}"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
@@ -19,7 +19,7 @@ Usage: Scripts/package_github_release.sh
 Environment:
   VERSION=1.0.0                 Version used in artifact names. Defaults to tag,
                                 app Info.plist version, or git commit.
-  APP_VARIANT=jxa|native        App bundle builder to use. Defaults to jxa.
+  APP_VARIANT=native|jxa        App bundle builder to use. Defaults to native.
   OUTPUT_DIR=dist/github        Directory for release artifacts.
   CODESIGN_IDENTITY=-           Signing identity. Defaults to ad-hoc signing.
   SKIP_CODESIGN=1               Skip signing.

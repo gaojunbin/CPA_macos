@@ -59,10 +59,10 @@ The release files are written to `dist/github/`:
 - `CPA-1.0.0-macOS.zip` as a fallback app bundle archive
 - `CPA-1.0.0-macOS-SHA256.txt` for checksum verification
 
-By default the package script uses the JXA app bundle because it does not require Xcode. To package the native Swift/AppKit bundle instead:
+By default the package script uses the native Swift/AppKit bundle, matching `Scripts/build_app.sh`. To package the JXA fallback bundle instead:
 
 ```bash
-APP_VARIANT=native VERSION=1.0.0 Scripts/package_github_release.sh
+APP_VARIANT=jxa VERSION=1.0.0 Scripts/package_github_release.sh
 ```
 
 Pushing a tag like `v1.0.0` runs the Release workflow and uploads the same assets to the GitHub Release.

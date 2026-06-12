@@ -13,11 +13,11 @@ on:
       app_variant:
         description: "App bundle implementation to package"
         required: false
-        default: "jxa"
+        default: "native"
         type: choice
         options:
-          - jxa
           - native
+          - jxa
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
       - name: Build release artifacts
         env:
           VERSION: ${{ inputs.version || github.ref_name }}
-          APP_VARIANT: ${{ inputs.app_variant || 'jxa' }}
+          APP_VARIANT: ${{ inputs.app_variant || 'native' }}
         run: Scripts/package_github_release.sh
 
       - name: Upload workflow artifact
