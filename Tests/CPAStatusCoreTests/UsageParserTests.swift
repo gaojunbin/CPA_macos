@@ -180,10 +180,10 @@ final class UsageParserTests: XCTestCase {
         """
 
         let snapshot = try XCTUnwrap(UsageParser.parse(body))
-        XCTAssertEqual(snapshot.additionalWindows.map(\.label), ["周限额", "7d 限额"])
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), ["周限额", "7天限额"])
         XCTAssertEqual(snapshot.additionalWindows.first?.remainingPercent, 60)
         XCTAssertEqual(snapshot.additionalWindows.first?.amountText, "40 / 100")
-        XCTAssertEqual(snapshot.additionalWindows.first?.detailText, "1h 后重置")
+        XCTAssertEqual(snapshot.additionalWindows.first?.detailText, "1h后重置")
         XCTAssertEqual(snapshot.additionalWindows.last?.remainingPercent, 90)
     }
 

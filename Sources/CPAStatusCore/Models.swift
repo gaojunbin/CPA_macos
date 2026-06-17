@@ -217,12 +217,15 @@ public struct AccountQuota: Identifiable, Equatable, Sendable {
     public let auth: AuthFile
     public let usage: UsageSnapshot?
     public let errorMessage: String?
+    /// Rich per-account runtime data parsed from the auth-files list entry, shown in the detail view.
+    public let detail: AccountDetail?
 
-    public init(auth: AuthFile, usage: UsageSnapshot?, errorMessage: String?) {
+    public init(auth: AuthFile, usage: UsageSnapshot?, errorMessage: String?, detail: AccountDetail? = nil) {
         self.id = auth.id
         self.auth = auth
         self.usage = usage
         self.errorMessage = errorMessage
+        self.detail = detail
     }
 
     public var isDisabled: Bool {
@@ -278,12 +281,215 @@ public struct AccountQuota: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct RecentRequestBucket: Equatable, Sendable {
+    public let time: String
+    public let success: Int
+    public let failed: Int
+}
+
+public struct AccountModelState: Equatable, Sendable {
+    public let status: String?
+    public let statusMessage: String?
+    public let unavailable: Bool
+    public let nextRetryAfter: Date?
+    public let lastErrorMessage: String?
+    public let quotaExceeded: Bool
+}
+
+public struct AccountCredits: Equatable, Sendable {
+    public let known: Bool
+    public let available: Bool
+    public let creditAmount: Double?
+    public let minCreditAmount: Double?
+    public let paidTierID: String?
+}
+
+/// Rich per-account runtime data parsed from a single `/v0/management/auth-files` list entry.
+/// Mirrors the fields the iOS detail screen surfaces, parsed leniently from raw JSON.
+public struct AccountDetail: Equatable, Sendable {
+    public let success: Int
+    public let failed: Int
+    public let recentRequests: [RecentRequestBucket]
+    public let modelStates: [String: AccountModelState]
+    public let quotaExceeded: Bool
+    public let quotaReason: String?
+    public let nextRecoverAt: Date?
+    public let lastRefresh: Date?
+    public let nextRefreshAfter: Date?
+    public let nextRetryAfter: Date?
+    public let lastErrorMessage: String?
+    public let accountType: String?
+    public let chatgptAccountID: String?
+    public let subscriptionActiveStart: Date?
+    public let subscriptionActiveUntil: Date?
+    public let source: String?
+    public let runtimeOnly: Bool
+    public let websockets: Bool?
+    public let priority: Int?
+    public let note: String?
+    public let createdAt: Date?
+    public let updatedAt: Date?
+    public let credits: AccountCredits?
+
+    public init(dict: [String: Any]) {
+        let now = Date()
+        success = integerValue(firstValue(dict["success"])) ?? 0
+        failed = integerValue(firstValue(dict["failed"])) ?? 0
+        recentRequests = (firstArray(dict["recent_requests"], dict["recentRequests"]) ?? []).compactMap { item in
+            guard let entry = item as? [String: Any] else { return nil }
+            return RecentRequestBucket(
+                time: firstString(entry["time"]) ?? "",
+                success: integerValue(entry["success"]) ?? 0,
+                failed: integerValue(entry["failed"]) ?? 0
+            )
+        }
+        var states: [String: AccountModelState] = [:]
+        if let raw = firstDictionary(dict["model_states"], dict["modelStates"]) {
+            for (key, value) in raw {
+                guard let entry = value as? [String: Any] else { continue }
+                let quota = firstDictionary(entry["quota"])
+                states[key] = AccountModelState(
+                    status: firstString(entry["status"]),
+                    statusMessage: accountDetailErrorText(firstValue(entry["status_message"], entry["statusMessage"])),
+                    unavailable: boolValue(entry["unavailable"]) ?? false,
+                    nextRetryAfter: dateValue(firstValue(entry["next_retry_after"], entry["nextRetryAfter"]), now: now),
+                    lastErrorMessage: accountDetailErrorText(firstValue(entry["last_error"], entry["lastError"])),
+                    quotaExceeded: boolValue(quota?["exceeded"]) ?? false
+                )
+            }
+        }
+        modelStates = states
+        let quota = firstDictionary(dict["quota"])
+        quotaExceeded = boolValue(quota?["exceeded"]) ?? false
+        quotaReason = accountDetailErrorText(quota?["reason"])
+        nextRecoverAt = dateValue(firstValue(quota?["next_recover_at"], quota?["nextRecoverAt"]), now: now)
+        lastRefresh = dateValue(firstValue(dict["last_refresh"], dict["lastRefresh"], dict["last_refreshed_at"], dict["lastRefreshedAt"]), now: now)
+        nextRefreshAfter = dateValue(firstValue(dict["next_refresh_after"], dict["nextRefreshAfter"]), now: now)
+        nextRetryAfter = dateValue(firstValue(dict["next_retry_after"], dict["nextRetryAfter"]), now: now)
+        lastErrorMessage = accountDetailErrorText(firstValue(dict["last_error"], dict["lastError"]))
+        accountType = firstString(firstValue(dict["account_type"], dict["accountType"]))
+        let idToken = firstDictionary(dict["id_token"], dict["idToken"])
+        chatgptAccountID = firstString(
+            idToken?["chatgpt_account_id"], idToken?["chatgptAccountID"], idToken?["chatgptAccountId"],
+            dict["chatgpt_account_id"], dict["chatgptAccountID"], dict["chatgptAccountId"],
+            dict["account_id"], dict["accountId"]
+        )
+        subscriptionActiveStart = dateValue(firstValue(idToken?["chatgpt_subscription_active_start"], idToken?["chatgptSubscriptionActiveStart"]), now: now)
+        subscriptionActiveUntil = dateValue(firstValue(idToken?["chatgpt_subscription_active_until"], idToken?["chatgptSubscriptionActiveUntil"]), now: now)
+        source = firstString(dict["source"])
+        runtimeOnly = boolValue(firstValue(dict["runtime_only"], dict["runtimeOnly"])) ?? false
+        websockets = boolValue(firstValue(dict["websockets"], dict["webSockets"]))
+        priority = integerValue(firstValue(dict["priority"]))
+        note = firstString(dict["note"])
+        createdAt = dateValue(firstValue(dict["created_at"], dict["createdAt"]), now: now)
+        updatedAt = dateValue(firstValue(dict["updated_at"], dict["updatedAt"], dict["modtime"], dict["modifiedAt"]), now: now)
+        if let raw = firstDictionary(dict["antigravity_credits"], dict["antigravityCredits"]) {
+            credits = AccountCredits(
+                known: boolValue(raw["known"]) ?? false,
+                available: boolValue(raw["available"]) ?? false,
+                creditAmount: numberValue(firstValue(raw["credit_amount"], raw["creditAmount"])),
+                minCreditAmount: numberValue(firstValue(raw["min_credit_amount"], raw["minCreditAmount"], raw["minimumCreditAmountForUsage"])),
+                paidTierID: firstString(raw["paid_tier_id"], raw["paidTierID"], raw["paidTierId"])
+            )
+        } else {
+            credits = nil
+        }
+    }
+
+    public var totalRequests: Int { success + failed }
+
+    public var successRate: Double? {
+        guard totalRequests > 0 else { return nil }
+        return Double(success) / Double(totalRequests)
+    }
+
+    /// Models currently cooling, exhausted, or in error, sorted by name.
+    public var activeModelCooldowns: [(model: String, state: AccountModelState)] {
+        let now = Date()
+        return modelStates
+            .filter { _, state in
+                let status = (state.status ?? "").lowercased()
+                let hasFutureRetry = state.nextRetryAfter.map { $0 > now } == true
+                return state.unavailable || state.quotaExceeded || hasFutureRetry ||
+                    status.contains("error") || status.contains("fail") || status.contains("limit") ||
+                    status.contains("exceeded") || status.contains("cool") || status.contains("quota") ||
+                    status.contains("unavailable") ||
+                    (state.lastErrorMessage ?? "").isEmpty == false
+            }
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .map { (model: $0.key, state: $0.value) }
+    }
+
+    /// Soonest future recovery time across the account quota, retry, and per-model states.
+    public var nextRecoveryDate: Date? {
+        let now = Date()
+        func future(_ date: Date?) -> Date? {
+            guard let date, date > now else { return nil }
+            return date
+        }
+        let modelMin = modelStates.values.compactMap { future($0.nextRetryAfter) }.min()
+        return [future(nextRecoverAt), future(nextRetryAfter), modelMin].compactMap { $0 }.min()
+    }
+}
+
+private func accountDetailErrorText(_ value: Any?) -> String? {
+    if let string = firstString(value) {
+        return string
+    }
+    guard let dictionary = value as? [String: Any] else {
+        return nil
+    }
+    return firstString(
+        dictionary["message"], dictionary["error"], dictionary["detail"],
+        dictionary["reason"], dictionary["description"],
+        dictionary["status_message"], dictionary["statusMessage"]
+    )
+}
+
+public struct ModelsResponse: Decodable, Sendable {
+    public let models: [CPAModelDefinition]
+}
+
+public struct CPAModelDefinition: Decodable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let displayName: String?
+    public let type: String?
+    public let ownedBy: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case type
+        case displayName = "display_name"
+        case displayNameCamel = "displayName"
+        case ownedBy = "owned_by"
+        case ownedByCamel = "ownedBy"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = container.lossyString(forKey: .id) ?? "unknown"
+        displayName = firstNonEmpty(
+            container.lossyString(forKey: .displayName),
+            container.lossyString(forKey: .displayNameCamel)
+        )
+        type = container.lossyString(forKey: .type)
+        ownedBy = firstNonEmpty(
+            container.lossyString(forKey: .ownedBy),
+            container.lossyString(forKey: .ownedByCamel)
+        )
+    }
+}
+
 public struct PoolSummary: Equatable, Sendable {
     public let totalAccounts: Int
     public let quotaAccounts: Int
     public let errorAccounts: Int
     public let disabledAccounts: Int
+    /// Number of Codex (5h/7d window) accounts the primary/weekly averages are based on.
+    public let codexAccounts: Int
+    /// Average remaining percent of the Codex 5-hour window across Codex accounts only.
     public let primaryAverage: Double?
+    /// Average remaining percent of the Codex 7-day window across Codex accounts only.
     public let weeklyAverage: Double?
     public let fetchedAt: Date
 
@@ -292,8 +498,13 @@ public struct PoolSummary: Equatable, Sendable {
         self.quotaAccounts = accounts.filter { $0.usage?.hasQuotaSignal == true }.count
         self.errorAccounts = accounts.filter { ($0.errorMessage ?? "").isEmpty == false }.count
         self.disabledAccounts = accounts.filter(\.isDisabled).count
-        self.primaryAverage = PoolSummary.average(accounts.compactMap(\.primaryRemainingPercent))
-        self.weeklyAverage = PoolSummary.average(accounts.compactMap(\.weeklyRemainingPercent))
+        // The 5h/7d headline metric is Codex-specific: only Codex exposes rolling
+        // 5-hour and 7-day windows, so the average is scoped to Codex accounts and
+        // never polluted by other providers' quota shapes.
+        let codexAccounts = accounts.filter { $0.auth.isCodexLike }
+        self.codexAccounts = codexAccounts.count
+        self.primaryAverage = PoolSummary.average(codexAccounts.compactMap(\.primaryRemainingPercent))
+        self.weeklyAverage = PoolSummary.average(codexAccounts.compactMap(\.weeklyRemainingPercent))
         self.fetchedAt = fetchedAt
     }
 

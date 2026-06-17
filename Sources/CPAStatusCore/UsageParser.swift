@@ -141,7 +141,14 @@ public enum UsageParser {
                 return nil
             }
             let quota = firstDictionary(match.entry["quotaInfo"], match.entry["quota_info"]) ?? [:]
-            let remaining = fractionValue(firstValue(quota["remainingFraction"], quota["remaining_fraction"], quota["remaining"]))
+            let remaining = fractionOrPercentFractionValue(firstValue(quota["remainingFraction"], quota["remaining_fraction"]))
+                ?? percentNumberValue(firstValue(
+                    quota["remainingPercent"],
+                    quota["remaining_percent"],
+                    quota["remainingPercentage"],
+                    quota["remaining_percentage"]
+                )).map { $0 / 100 }
+                ?? fractionOrPercentFractionValue(quota["remaining"])
             let resetTime = firstString(quota["resetTime"], quota["reset_time"])
             let displayName = firstString(match.entry["displayName"], match.entry["display_name"])
             let effectiveRemaining = remaining ?? (resetTime == nil ? nil : 0)
@@ -202,8 +209,8 @@ public enum UsageParser {
         return nil
     }
 
-    private static func displayAntigravityReset(_ date: Date?) -> String {
-        displayShortDate(date) ?? "-"
+    private static func displayAntigravityReset(_ date: Date?) -> String? {
+        displayShortDate(date)
     }
 
     private static func displayShortDate(_ date: Date?) -> String? {
@@ -264,7 +271,8 @@ public enum UsageParser {
             resetAfterSeconds: nil,
             resetAt: nil,
             displayValue: displayCredits(creditAmount),
-            detailText: minimumAmount.map { "min \(displayCredits($0))" } ?? "credits",
+            amountText: minimumAmount.map { "min \(displayCredits($0))" },
+            detailText: nil,
             isUsable: isUsable
         )
     }
@@ -332,8 +340,8 @@ public enum UsageParser {
 
         if let extraUsage = firstDictionary(usage["extra_usage"], usage["extraUsage"]),
            boolValue(firstValue(extraUsage["is_enabled"], extraUsage["isEnabled"])) == true {
-            let used = numberValue(firstValue(extraUsage["used_credits"], extraUsage["usedCredits"]))
-            let limit = numberValue(firstValue(extraUsage["monthly_limit"], extraUsage["monthlyLimit"]))
+            let used = centsValue(firstValue(extraUsage["used_credits"], extraUsage["usedCredits"]))
+            let limit = centsValue(firstValue(extraUsage["monthly_limit"], extraUsage["monthlyLimit"]))
             windows.append(QuotaWindow(
                 id: "claude-extra-usage",
                 label: "额外用量",
@@ -476,7 +484,7 @@ public enum UsageParser {
         let duration = integerValue(firstValue(window["duration"], item["duration"], raw["duration"]))
         let unit = firstString(firstValue(window["timeUnit"], window["time_unit"], item["timeUnit"], raw["timeUnit"]))
         if let duration, duration > 0 {
-            return "\(displayKimiDuration(duration, unit: unit)) 限额"
+            return "\(displayKimiDuration(duration, unit: unit))限额"
         }
         return "限额 #\(index + 1)"
     }
@@ -484,13 +492,13 @@ public enum UsageParser {
     private static func displayKimiDuration(_ duration: Int, unit: String?) -> String {
         switch unit?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
         case "MINUTES":
-            return duration % 60 == 0 ? "\(duration / 60)h" : "\(duration)m"
+            return duration % 60 == 0 ? "\(duration / 60)小时" : "\(duration)分钟"
         case "HOURS":
-            return "\(duration)h"
+            return "\(duration)小时"
         case "DAYS":
-            return "\(duration)d"
+            return "\(duration)天"
         default:
-            return "\(duration)s"
+            return "\(duration)秒"
         }
     }
 
@@ -498,12 +506,12 @@ public enum UsageParser {
         for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
             if let resetAt = dateValue(raw[key], now: now) {
                 let remaining = resetAt.timeIntervalSince(now)
-                return remaining > 0 ? "\(displayDuration(seconds: remaining)) 后重置" : "now"
+                return remaining > 0 ? "\(displayDuration(seconds: remaining))后重置" : "已重置"
             }
         }
         for key in ["reset_in", "resetIn", "ttl"] {
             if let seconds = numberValue(raw[key]), seconds > 0 {
-                return "\(displayDuration(seconds: seconds)) 后重置"
+                return "\(displayDuration(seconds: seconds))后重置"
             }
         }
         return nil
@@ -571,7 +579,10 @@ public enum UsageParser {
 
     private static func centsValue(_ value: Any?) -> Double? {
         if let dictionary = value as? [String: Any] {
-            return numberValue(dictionary["val"])
+            return centsValue(dictionary["val"])
+        }
+        if let currency = currencyCentsValue(value) {
+            return currency
         }
         return numberValue(value)
     }
@@ -667,19 +678,31 @@ public enum UsageParser {
             return nil
         }
 
-        var used = numberValue(firstValue(raw["used_percent"], raw["usedPercent"]))
+        var used = percentNumberValue(firstValue(raw["used_percent"], raw["usedPercent"]))
+        var remaining = percentNumberValue(firstValue(
+            raw["remaining_percent"],
+            raw["remainingPercent"],
+            raw["remaining_percentage"],
+            raw["remainingPercentage"]
+        ))
         let resetAfter = numberValue(firstValue(raw["reset_after_seconds"], raw["resetAfterSeconds"]))
         let resetAt = dateValue(firstValue(raw["reset_at"], raw["resetAt"]), now: now)
-        if used == nil, exhaustedHint, resetAfter != nil || resetAt != nil {
+        if used == nil, remaining == nil, exhaustedHint, resetAfter != nil || resetAt != nil {
             used = 100
         }
+        if used == nil, let remaining {
+            used = 100 - remaining
+        }
+        if remaining == nil, let used {
+            remaining = 100 - used
+        }
         let normalizedUsed = used.map { clamp($0, min: 0, max: 100) }
-        let remaining = normalizedUsed.map { clamp(100 - $0, min: 0, max: 100) }
+        let normalizedRemaining = remaining.map { clamp($0, min: 0, max: 100) }
         return QuotaWindow(
             id: id,
             label: label,
             usedPercent: normalizedUsed,
-            remainingPercent: remaining,
+            remainingPercent: normalizedRemaining,
             resetAfterSeconds: resetAfter,
             resetAt: resetAt
         )
@@ -687,34 +710,46 @@ public enum UsageParser {
 
     private static func parseGeneric(_ json: Any, now: Date) -> UsageSnapshot? {
         let pairs = flatten(json)
-        let used = firstNumberInPairs(pairs, matching: [
+        let used = firstPercentInPairs(pairs, matching: [
             "used_percent", "usedpercent", "usage_percent", "usagepercent"
+        ])
+        let remaining = firstPercentInPairs(pairs, matching: [
+            "remaining_percent", "remainingpercent", "remaining_percentage", "remainingpercentage"
         ])
         let resetSeconds = firstNumberInPairs(pairs, matching: [
             "reset_after_seconds", "resetafterseconds", "retry_after", "retryafter"
         ])
-        let resetAtRaw = firstNumberInPairs(pairs, matching: ["reset_at", "resetat", "reset_time", "resettime"])
+        let resetAt = firstValueInPairs(pairs, matching: ["reset_at", "resetat", "reset_time", "resettime"])
+            .flatMap { dateValue($0, now: now) }
         let status = firstStringInPairs(pairs, matching: ["status", "code", "message", "error"])
         let lowerStatus = status?.lowercased() ?? ""
         let limitSignal = ["rate limit", "quota", "usage limit", "insufficient_quota", "limit_reached"].contains { lowerStatus.contains($0) }
 
         var primaryUsed = used
-        if primaryUsed == nil, limitSignal, resetSeconds != nil || resetAtRaw != nil {
+        var primaryRemaining = remaining
+        if primaryUsed == nil, primaryRemaining == nil, limitSignal, resetSeconds != nil || resetAt != nil {
             primaryUsed = 100
         }
+        if primaryUsed == nil, let primaryRemaining {
+            primaryUsed = 100 - primaryRemaining
+        }
+        if primaryRemaining == nil, let primaryUsed {
+            primaryRemaining = 100 - primaryUsed
+        }
 
-        guard primaryUsed != nil || resetSeconds != nil || resetAtRaw != nil else {
+        guard primaryUsed != nil || primaryRemaining != nil || resetSeconds != nil || resetAt != nil else {
             return nil
         }
 
         let normalizedUsed = primaryUsed.map { clamp($0, min: 0, max: 100) }
+        let normalizedRemaining = primaryRemaining.map { clamp($0, min: 0, max: 100) }
         let window = QuotaWindow(
             id: "generic",
             label: "quota",
             usedPercent: normalizedUsed,
-            remainingPercent: normalizedUsed.map { clamp(100 - $0, min: 0, max: 100) },
+            remainingPercent: normalizedRemaining,
             resetAfterSeconds: resetSeconds,
-            resetAt: resetAtRaw.flatMap { dateValue($0, now: now) }
+            resetAt: resetAt
         )
         return UsageSnapshot(
             planType: firstStringInPairs(pairs, matching: ["plan_type", "plantype", "plan"]),
@@ -749,11 +784,30 @@ public enum UsageParser {
         return nil
     }
 
+    private static func firstPercentInPairs(_ pairs: [(String, Any)], matching keys: [String]) -> Double? {
+        for key in keys {
+            if let match = pairs.first(where: { path, _ in pathComponent(path, matches: key) }),
+               let number = percentNumberValue(match.1) {
+                return number
+            }
+        }
+        return nil
+    }
+
     private static func firstStringInPairs(_ pairs: [(String, Any)], matching keys: [String]) -> String? {
         for key in keys {
             if let match = pairs.first(where: { path, _ in pathComponent(path, matches: key) }),
                let string = firstString(match.1) {
                 return string
+            }
+        }
+        return nil
+    }
+
+    private static func firstValueInPairs(_ pairs: [(String, Any)], matching keys: [String]) -> Any? {
+        for key in keys {
+            if let match = pairs.first(where: { path, _ in pathComponent(path, matches: key) }) {
+                return match.1
             }
         }
         return nil
@@ -829,6 +883,9 @@ func firstString(_ values: Any?...) -> String? {
                 return trimmed
             }
         } else if let number = value as? NSNumber {
+            if isBooleanNumber(number) {
+                return number.boolValue ? "true" : "false"
+            }
             return number.stringValue
         }
     }
@@ -874,6 +931,9 @@ func findFirstDictionary(named target: String, in value: Any) -> [String: Any]? 
 }
 
 func numberValue(_ value: Any?) -> Double? {
+    if let number = value as? NSNumber, isBooleanNumber(number) {
+        return nil
+    }
     switch value {
     case let value as Double:
         return value.isFinite ? value : nil
@@ -885,14 +945,98 @@ func numberValue(_ value: Any?) -> Double? {
     case let value as Int64:
         return Double(value)
     case let value as NSNumber:
+        guard !isBooleanNumber(value) else {
+            return nil
+        }
         let double = value.doubleValue
         return double.isFinite ? double : nil
     case let value as String:
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return Double(trimmed)
+        guard let numeric = normalizedNumericString(value) else {
+            return nil
+        }
+        return Double(numeric)
     default:
         return nil
     }
+}
+
+private func normalizedNumericString(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return nil
+    }
+    guard !trimmed.hasSuffix("%") else {
+        return nil
+    }
+    let normalized = trimmed.replacingOccurrences(of: ",", with: "")
+    guard isPlainDecimalString(normalized) else {
+        return nil
+    }
+    return normalized
+}
+
+private func isPlainDecimalString(_ value: String) -> Bool {
+    guard !value.isEmpty else {
+        return false
+    }
+
+    var index = value.startIndex
+    if value[index] == "+" || value[index] == "-" {
+        index = value.index(after: index)
+        guard index < value.endIndex else {
+            return false
+        }
+    }
+
+    var hasDigit = false
+    var hasDecimalSeparator = false
+    while index < value.endIndex {
+        let character = value[index]
+        if character == "." {
+            guard !hasDecimalSeparator else {
+                return false
+            }
+            hasDecimalSeparator = true
+        } else if character.isNumber {
+            hasDigit = true
+        } else {
+            return false
+        }
+        index = value.index(after: index)
+    }
+    return hasDigit
+}
+
+private func currencyCentsValue(_ value: Any?) -> Double? {
+    guard let string = value as? String else {
+        return nil
+    }
+    var trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+    let currencySymbols = CharacterSet(charactersIn: "$¥￥€£")
+    guard let first = trimmed.unicodeScalars.first, currencySymbols.contains(first) else {
+        return nil
+    }
+    while let first = trimmed.unicodeScalars.first, currencySymbols.contains(first) {
+        trimmed.removeFirst()
+        trimmed = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    guard let number = normalizedNumericString(trimmed).flatMap(Double.init), number.isFinite else {
+        return nil
+    }
+    return number * 100
+}
+
+func percentNumberValue(_ value: Any?) -> Double? {
+    if let string = value as? String {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasSuffix("%") {
+            let raw = String(trimmed.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+            if let number = Double(raw), number.isFinite {
+                return number
+            }
+        }
+    }
+    return numberValue(value)
 }
 
 func integerValue(_ value: Any?) -> Int? {
@@ -919,12 +1063,31 @@ func fractionValue(_ value: Any?) -> Double? {
     return nil
 }
 
+func fractionOrPercentFractionValue(_ value: Any?) -> Double? {
+    guard let fraction = fractionValue(value), fraction.isFinite else {
+        return nil
+    }
+    if fraction > 1, fraction <= 100 {
+        return fraction / 100
+    }
+    return fraction
+}
+
 func boolValue(_ value: Any?) -> Bool? {
     switch value {
+    case let value as NSNumber:
+        if isBooleanNumber(value) {
+            return value.boolValue
+        }
+        if value.doubleValue == 1 {
+            return true
+        }
+        if value.doubleValue == 0 {
+            return false
+        }
+        return nil
     case let value as Bool:
         return value
-    case let value as NSNumber:
-        return value.boolValue
     case let value as String:
         switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "1", "true", "yes", "on":
@@ -937,6 +1100,10 @@ func boolValue(_ value: Any?) -> Bool? {
     default:
         return nil
     }
+}
+
+private func isBooleanNumber(_ value: NSNumber) -> Bool {
+    CFGetTypeID(value) == CFBooleanGetTypeID()
 }
 
 func dateValue(_ value: Any?, now: Date) -> Date? {

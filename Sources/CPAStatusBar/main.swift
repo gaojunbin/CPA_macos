@@ -243,6 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 enum PopoverScreen {
     case dashboard
     case settings
+    case detail
 }
 
 struct PopoverState {
@@ -251,6 +252,11 @@ struct PopoverState {
     var screen: PopoverScreen = .dashboard
     var isLoading = false
     var errorMessage: String?
+    var detailAccount: AccountQuota?
+    var detailModels: [CPAModelDefinition] = []
+    var detailModelsLoading = false
+    var detailModelsError: String?
+    var detailRefreshing = false
 }
 
 @MainActor
@@ -304,6 +310,8 @@ final class PopoverViewController: NSViewController {
             renderDashboard(in: root)
         case .settings:
             renderSettings(in: root)
+        case .detail:
+            renderDetail(in: root)
         }
     }
 
@@ -554,28 +562,36 @@ final class PopoverViewController: NSViewController {
 
     private func summaryView(_ summary: PoolSummary) -> NSView {
         let card = cardView()
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 8
+        column.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(column)
+        NSLayoutConstraint.activate([
+            column.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
+            column.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
+            column.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            column.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
+        ])
+
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 0
         row.alignment = .centerY
         row.distribution = .fillEqually
         row.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(row)
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
-            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
-            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
-            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
-        ])
+        column.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
 
         row.addArrangedSubview(statView(
             value: displayPercent(summary.primaryAverage),
-            label: "5h",
+            label: "Codex 5h",
             color: summaryColor(summary.primaryAverage)
         ))
         row.addArrangedSubview(statView(
             value: displayPercent(summary.weeklyAverage),
-            label: "7d",
+            label: "Codex 7d",
             color: summaryColor(summary.weeklyAverage)
         ))
         let accountText = (summary.quotaAccounts == summary.totalAccounts || summary.quotaAccounts == 0)
@@ -586,7 +602,25 @@ final class PopoverViewController: NSViewController {
             label: summary.totalAccounts == 1 ? "Account" : "Accounts",
             color: .labelColor
         ))
+
+        let caption = label(summaryCaption(summary), font: .systemFont(ofSize: 10), color: .tertiaryLabelColor)
+        caption.alignment = .center
+        caption.maximumNumberOfLines = 2
+        caption.lineBreakMode = .byWordWrapping
+        caption.preferredMaxLayoutWidth = popoverWidth - 64
+        column.addArrangedSubview(caption)
+        caption.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
         return card
+    }
+
+    private func summaryCaption(_ summary: PoolSummary) -> String {
+        // The 5h / 7d figures are Codex-only rolling windows; other providers report
+        // their own quota shapes (credits, balances, per-model limits) shown per card below.
+        if summary.codexAccounts == 0 {
+            return "5h · 7d 为 Codex 账号平均剩余额度（当前无 Codex 账号）；其他渠道额度见下方各自卡片。"
+        }
+        let suffix = summary.codexAccounts == 1 ? "" : "，共 \(summary.codexAccounts) 个"
+        return "5h · 7d 为 Codex 账号平均剩余额度\(suffix)；其他渠道额度见下方各自卡片。"
     }
 
     private func statView(value: String, label labelText: String, color: NSColor) -> NSView {
@@ -758,7 +792,8 @@ final class PopoverViewController: NSViewController {
         if !supportsUsage {
             return compactAccountRow(account)
         }
-        let card = cardView()
+        let card = clickableCardView()
+        card.onClick = { [weak self] in self?.openDetail(account) }
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -822,7 +857,8 @@ final class PopoverViewController: NSViewController {
     }
 
     private func compactAccountRow(_ account: AccountQuota) -> NSView {
-        let card = cardView()
+        let card = clickableCardView()
+        card.onClick = { [weak self] in self?.openDetail(account) }
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -918,6 +954,547 @@ final class PopoverViewController: NSViewController {
         container.addArrangedSubview(bar)
         bar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
         return container
+    }
+
+    // MARK: - Account detail
+
+    private func openDetail(_ account: AccountQuota) {
+        state.detailAccount = account
+        state.detailModels = []
+        state.detailModelsError = nil
+        state.detailModelsLoading = false
+        state.detailRefreshing = false
+        state.screen = .detail
+        render()
+        loadDetailModels(for: account)
+    }
+
+    private func showDashboard() {
+        state.screen = .dashboard
+        state.detailAccount = nil
+        state.detailModels = []
+        render()
+    }
+
+    private func loadDetailModels(for account: AccountQuota) {
+        guard state.settings.isConfigured else { return }
+        state.detailModelsLoading = true
+        render()
+        let settings = state.settings
+        let accountID = account.id
+        Task { @MainActor [weak self] in
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                let models = try await client.fetchModels(for: account.auth)
+                guard let self, self.state.screen == .detail, self.state.detailAccount?.id == accountID else { return }
+                self.state.detailModels = models
+                self.state.detailModelsLoading = false
+                self.render()
+            } catch {
+                guard let self, self.state.screen == .detail, self.state.detailAccount?.id == accountID else { return }
+                self.state.detailModelsError = error.localizedDescription
+                self.state.detailModelsLoading = false
+                self.render()
+            }
+        }
+    }
+
+    private func refreshDetail() {
+        guard let account = state.detailAccount, state.settings.isConfigured else { return }
+        state.detailRefreshing = true
+        state.detailModelsLoading = true
+        render()
+        let settings = state.settings
+        let accountID = account.id
+        let existingDetail = account.detail
+        Task { @MainActor [weak self] in
+            let client = CLIProxyAPIClient(settings: settings)
+            let refreshed = await client.refreshUsage(for: account.auth, detail: existingDetail)
+            let models = try? await client.fetchModels(for: account.auth)
+            guard let self, self.state.screen == .detail, self.state.detailAccount?.id == accountID else { return }
+            self.state.detailAccount = refreshed
+            if let models {
+                self.state.detailModels = models
+                self.state.detailModelsError = nil
+            }
+            self.state.detailRefreshing = false
+            self.state.detailModelsLoading = false
+            self.render()
+        }
+    }
+
+    private func renderDetail(in root: NSStackView) {
+        guard let account = state.detailAccount else {
+            renderDashboard(in: root)
+            return
+        }
+        addFullWidth(detailHeader(account), to: root)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.scrollerStyle = .overlay
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        let stack = TopAlignedStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 6, right: 0)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = stack
+        NSLayoutConstraint.activate([
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+
+        func addSection(_ view: NSView) {
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        addSection(detailHeroCard(account))
+        addSection(detailQuotaCard(account))
+        addSection(detailRunStatusCard(account))
+        if let detail = account.detail {
+            if detail.totalRequests > 0 || !detail.recentRequests.isEmpty {
+                addSection(detailRecentRequestsCard(detail))
+            }
+            if !detail.activeModelCooldowns.isEmpty {
+                addSection(detailModelCooldownCard(detail))
+            }
+        }
+        addSection(detailModelsCard(account))
+        addSection(detailAccountInfoCard(account))
+
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
+        addFullWidth(scroll, to: root)
+    }
+
+    private func detailHeader(_ account: AccountQuota) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+
+        let back = circularIconButton(symbol: "chevron.left", tooltip: "Back") { [weak self] in
+            self?.showDashboard()
+        }
+        row.addArrangedSubview(back)
+
+        let title = label(account.auth.displayName, font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor)
+        title.lineBreakMode = .byTruncatingMiddle
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(title)
+        row.addArrangedSubview(NSView())
+
+        let refresh = circularIconButton(symbol: "arrow.clockwise", tooltip: "Refresh") { [weak self] in
+            self?.refreshDetail()
+        }
+        refresh.isEnabled = !state.detailRefreshing
+        row.addArrangedSubview(refresh)
+        return row
+    }
+
+    private func detailHeroCard(_ account: AccountQuota) -> NSView {
+        let card = cardView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
+        ])
+
+        let top = NSStackView()
+        top.orientation = .horizontal
+        top.alignment = .centerY
+        top.spacing = 10
+        top.addArrangedSubview(providerBadgeView(for: account.auth))
+
+        let titleStack = NSStackView()
+        titleStack.orientation = .vertical
+        titleStack.alignment = .leading
+        titleStack.spacing = 2
+        let name = label(account.auth.displayName, font: .systemFont(ofSize: 14, weight: .semibold), color: .labelColor)
+        name.lineBreakMode = .byTruncatingMiddle
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleStack.addArrangedSubview(name)
+        let provider = ProviderCatalog.info(for: account.auth.normalizedProvider).displayName
+        let subtitle = account.effectivePlanType.map { "\(provider) · \($0.capitalized)" } ?? provider
+        titleStack.addArrangedSubview(label(subtitle, font: .systemFont(ofSize: 11, weight: .regular), color: .secondaryLabelColor))
+        top.addArrangedSubview(titleStack)
+        top.addArrangedSubview(NSView())
+        let status = detailStatus(account)
+        top.addArrangedSubview(pillLabel(status.0, color: status.1))
+        stack.addArrangedSubview(top)
+        top.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let counters = NSStackView()
+        counters.orientation = .horizontal
+        counters.distribution = .fillEqually
+        counters.alignment = .centerY
+        counters.spacing = 0
+        counters.addArrangedSubview(statView(value: "\(account.detail?.success ?? 0)", label: "成功", color: .systemGreen))
+        counters.addArrangedSubview(statView(value: "\(account.detail?.failed ?? 0)", label: "失败", color: .systemRed))
+        counters.addArrangedSubview(statView(value: displayPercent(account.lowestRemainingPercent), label: "最低剩余", color: summaryColor(account.lowestRemainingPercent)))
+        stack.addArrangedSubview(counters)
+        counters.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        return card
+    }
+
+    private func detailQuotaCard(_ account: AccountQuota) -> NSView {
+        detailSectionCard(title: "实时剩余额度", symbol: "gauge.with.dots.needle.50percent") { stack in
+            if let error = account.errorMessage, !error.isEmpty {
+                let note = noteLabel(text: trimError(error), color: .systemRed)
+                stack.addArrangedSubview(note)
+                note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            } else if account.usage?.hasQuotaSignal == true {
+                for (labelText, window) in quotaRows(for: account.usage) {
+                    let row = quotaLine(label: labelText, window: window)
+                    stack.addArrangedSubview(row)
+                    row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                }
+            } else {
+                let note = noteLabel(text: account.auth.disabled ? "已暂停" : "该来源仅显示身份状态")
+                stack.addArrangedSubview(note)
+                note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            if let date = account.usage?.fetchedAt {
+                stack.addArrangedSubview(label("同步于 \(relativeShort(date))", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
+            }
+        }
+    }
+
+    private func detailRunStatusCard(_ account: AccountQuota) -> NSView {
+        detailSectionCard(title: "运行状态", symbol: "speedometer") { stack in
+            let detail = account.detail
+            var added = false
+            @MainActor func addRow(_ title: String, _ value: String?) {
+                guard let value, !value.isEmpty else { return }
+                let row = detailRow(title: title, value: value)
+                stack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                added = true
+            }
+            addRow("原因", detail?.quotaReason ?? account.auth.statusMessage)
+            if let date = detail?.nextRecoveryDate {
+                addRow("预计恢复", absoluteTime(date))
+            }
+            if let date = detail?.lastRefresh {
+                addRow("上次刷新", absoluteTime(date))
+            }
+            if let date = detail?.nextRefreshAfter {
+                addRow("下次刷新", absoluteTime(date))
+            }
+            if let credits = detail?.credits, credits.known {
+                addRow("AI Credits", creditsLine(credits))
+            }
+            addRow("最近错误", detail?.lastErrorMessage)
+            if !added {
+                addRow("状态", account.auth.status ?? "未知")
+            }
+        }
+    }
+
+    private func detailRecentRequestsCard(_ detail: AccountDetail) -> NSView {
+        detailSectionCard(title: "最近请求", symbol: "chart.bar.xaxis") { stack in
+            let summary = label("累计成功 \(detail.success) · 失败 \(detail.failed)", font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor)
+            stack.addArrangedSubview(summary)
+            if !detail.recentRequests.isEmpty {
+                let chart = RequestBarsView(buckets: detail.recentRequests)
+                chart.heightAnchor.constraint(equalToConstant: 40).isActive = true
+                stack.addArrangedSubview(chart)
+                chart.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+        }
+    }
+
+    private func detailModelCooldownCard(_ detail: AccountDetail) -> NSView {
+        detailSectionCard(title: "模型状态", symbol: "hourglass") { stack in
+            for item in detail.activeModelCooldowns {
+                let block = NSStackView()
+                block.orientation = .vertical
+                block.alignment = .leading
+                block.spacing = 3
+                block.addArrangedSubview(label(item.model, font: .systemFont(ofSize: 11, weight: .semibold), color: .labelColor))
+                let message = firstNonEmpty(item.state.statusMessage, item.state.lastErrorMessage, item.state.status)
+                if let message {
+                    block.addArrangedSubview(noteLabel(text: message))
+                }
+                if let date = item.state.nextRetryAfter, date > Date() {
+                    block.addArrangedSubview(label("恢复 \(absoluteTime(date))", font: .systemFont(ofSize: 10), color: .systemOrange))
+                }
+                stack.addArrangedSubview(block)
+                block.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+        }
+    }
+
+    private func detailModelsCard(_ account: AccountQuota) -> NSView {
+        detailSectionCard(title: "可用模型", symbol: "square.stack.3d.up.fill") { stack in
+            if state.detailModelsLoading && state.detailModels.isEmpty {
+                stack.addArrangedSubview(label("正在加载模型…", font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+            } else if let error = state.detailModelsError, state.detailModels.isEmpty {
+                let note = noteLabel(text: trimError(error), color: .systemRed)
+                stack.addArrangedSubview(note)
+                note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            } else if state.detailModels.isEmpty {
+                stack.addArrangedSubview(label("暂无模型数据", font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+            } else {
+                for model in sortedDetailModels(account) {
+                    let row = modelRowView(model, account: account)
+                    stack.addArrangedSubview(row)
+                    row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                }
+            }
+        }
+    }
+
+    private func detailAccountInfoCard(_ account: AccountQuota) -> NSView {
+        detailSectionCard(title: "账号信息", symbol: "info.circle.fill") { stack in
+            let auth = account.auth
+            let detail = account.detail
+            @MainActor func addRow(_ title: String, _ value: String?) {
+                guard let value, !value.isEmpty else { return }
+                let row = detailRow(title: title, value: value)
+                stack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            addRow("Provider", ProviderCatalog.info(for: auth.normalizedProvider).displayName)
+            addRow("邮箱", auth.email)
+            addRow("项目", auth.projectID)
+            addRow("账号类型", detail?.accountType)
+            addRow("账号标识", auth.account)
+            addRow("ChatGPT Account ID", detail?.chatgptAccountID ?? auth.accountID)
+            addRow("Auth Index", auth.authIndex.isEmpty ? nil : auth.authIndex)
+            addRow("计划", account.effectivePlanType?.capitalized)
+            if let date = detail?.subscriptionActiveStart {
+                addRow("订阅开始", absoluteTime(date))
+            }
+            if let date = detail?.subscriptionActiveUntil {
+                addRow("订阅到期", absoluteTime(date))
+            }
+            if detail?.runtimeOnly == true {
+                addRow("来源", "运行时")
+            } else {
+                addRow("来源", detail?.source)
+            }
+            if let websockets = detail?.websockets {
+                addRow("WebSocket", websockets ? "启用" : "关闭")
+            }
+            if let priority = detail?.priority {
+                addRow("优先级", "\(priority)")
+            }
+            addRow("备注", detail?.note)
+            if let date = detail?.updatedAt {
+                addRow("更新时间", absoluteTime(date))
+            }
+        }
+    }
+
+    // MARK: - Detail building blocks
+
+    private func detailSectionCard(title: String, symbol: String, build: @MainActor (NSStackView) -> Void) -> NSView {
+        let card = cardView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 9
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -11)
+        ])
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 6
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfig) ?? NSImage())
+        icon.contentTintColor = .secondaryLabelColor
+        header.addArrangedSubview(icon)
+        header.addArrangedSubview(label(title, font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor))
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        build(stack)
+        return card
+    }
+
+    private func detailRow(title: String, value: String) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.addArrangedSubview(label(title, font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor))
+        let valueLabel = label(value, font: .systemFont(ofSize: 12, weight: .regular), color: .labelColor)
+        valueLabel.lineBreakMode = .byWordWrapping
+        valueLabel.maximumNumberOfLines = 3
+        valueLabel.isSelectable = true
+        valueLabel.preferredMaxLayoutWidth = popoverWidth - 92
+        stack.addArrangedSubview(valueLabel)
+        return stack
+    }
+
+    private func detailStatus(_ account: AccountQuota) -> (String, NSColor) {
+        if account.errorMessage?.isEmpty == false {
+            return ("异常", .systemRed)
+        }
+        if account.isDisabled {
+            return ("已停用", .tertiaryLabelColor)
+        }
+        if account.detail?.quotaExceeded == true || account.hasUnusableQuotaWindow {
+            return ("受限", .systemOrange)
+        }
+        if account.isUnavailable {
+            return ("不可用", .tertiaryLabelColor)
+        }
+        if let remaining = account.lowestRemainingPercent {
+            if remaining <= 15 { return ("紧张", .systemRed) }
+            if remaining <= 35 { return ("偏低", .systemOrange) }
+        }
+        if account.usage?.hasQuotaSignal == true || account.detail != nil {
+            return ("可用", .systemGreen)
+        }
+        return (account.auth.status ?? "未知", .secondaryLabelColor)
+    }
+
+    private func creditsLine(_ credits: AccountCredits) -> String {
+        let state = credits.available ? "可用" : "不足"
+        let amount = displayCredits(credits.creditAmount)
+        if let minimum = credits.minCreditAmount {
+            return "\(state) · \(amount) / \(displayCredits(minimum))"
+        }
+        return "\(state) · \(amount)"
+    }
+
+    private func sortedDetailModels(_ account: AccountQuota) -> [CPAModelDefinition] {
+        state.detailModels.sorted { lhs, rhs in
+            let leftRank = modelRuntime(lhs, account: account).rank
+            let rightRank = modelRuntime(rhs, account: account).rank
+            if leftRank != rightRank {
+                return leftRank < rightRank
+            }
+            let leftName = lhs.displayName ?? lhs.id
+            let rightName = rhs.displayName ?? rhs.id
+            return leftName.localizedCaseInsensitiveCompare(rightName) == .orderedAscending
+        }
+    }
+
+    private func modelRowView(_ model: CPAModelDefinition, account: AccountQuota) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+
+        let nameStack = NSStackView()
+        nameStack.orientation = .vertical
+        nameStack.alignment = .leading
+        nameStack.spacing = 1
+        let nameLabel = label(model.displayName ?? model.id, font: .systemFont(ofSize: 11, weight: .medium), color: .labelColor)
+        nameLabel.lineBreakMode = .byTruncatingMiddle
+        nameStack.addArrangedSubview(nameLabel)
+        if model.displayName != nil {
+            let idLabel = label(model.id, font: .systemFont(ofSize: 9, weight: .regular), color: .tertiaryLabelColor)
+            idLabel.lineBreakMode = .byTruncatingMiddle
+            nameStack.addArrangedSubview(idLabel)
+        }
+        nameStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(nameStack)
+        row.addArrangedSubview(NSView())
+        let runtime = modelRuntime(model, account: account)
+        row.addArrangedSubview(pillLabel(runtime.title, color: runtime.color))
+        return row
+    }
+
+    private func modelRuntime(_ model: CPAModelDefinition, account: AccountQuota) -> (rank: Int, title: String, color: NSColor) {
+        let keys = [model.id.lowercased(), (model.displayName ?? "").lowercased()].filter { !$0.isEmpty }
+        let modelState = account.detail?.modelStates.first { keys.contains($0.key.lowercased()) }?.value
+        guard let modelState else {
+            return (3, "可用", .systemGreen)
+        }
+        let status = (modelState.status ?? "").lowercased()
+        if status.contains("error") || status.contains("fail") || (modelState.lastErrorMessage ?? "").isEmpty == false {
+            return (0, "异常", .systemRed)
+        }
+        if modelState.unavailable || modelState.quotaExceeded ||
+            (modelState.nextRetryAfter.map { $0 > Date() } == true) ||
+            status.contains("cool") || status.contains("limit") || status.contains("quota") ||
+            status.contains("exceeded") || status.contains("unavailable") {
+            return (1, "受限", .systemOrange)
+        }
+        if status.contains("pending") || status.contains("refresh") {
+            return (2, "同步中", .systemBlue)
+        }
+        return (3, "可用", .systemGreen)
+    }
+
+    private func providerBadgeView(for auth: AuthFile, size: CGFloat = 30) -> NSView {
+        let info = ProviderCatalog.info(for: auth.normalizedProvider)
+        let accent = providerAccentColor(info.accentName)
+        let badge = RoundedView(fill: accent.withAlphaComponent(0.16), border: .clear, radius: 7)
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        let config = NSImage.SymbolConfiguration(pointSize: size * 0.45, weight: .semibold)
+        let icon = NSImageView(image: NSImage(systemSymbolName: info.symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) ?? NSImage())
+        icon.contentTintColor = accent
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(icon)
+        NSLayoutConstraint.activate([
+            badge.widthAnchor.constraint(equalToConstant: size),
+            badge.heightAnchor.constraint(equalToConstant: size),
+            icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor)
+        ])
+        return badge
+    }
+
+    private func pillLabel(_ text: String, color: NSColor) -> NSView {
+        let pill = RoundedView(fill: color.withAlphaComponent(0.16), border: .clear, radius: 5)
+        let textLabel = label(text, font: .systemFont(ofSize: 10, weight: .semibold), color: color)
+        textLabel.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(textLabel)
+        NSLayoutConstraint.activate([
+            textLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 7),
+            textLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7),
+            textLabel.topAnchor.constraint(equalTo: pill.topAnchor, constant: 2),
+            textLabel.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -2)
+        ])
+        return pill
+    }
+
+    private func clickableCardView() -> ClickableCardView {
+        ClickableCardView(
+            fill: NSColor.controlBackgroundColor.withAlphaComponent(0.55),
+            border: NSColor.separatorColor.withAlphaComponent(0.18),
+            radius: 12
+        )
+    }
+
+    private func absoluteTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private func relativeShort(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 
     private func emptyDashboardView() -> NSView {
@@ -1177,7 +1754,7 @@ final class TopAlignedStackView: NSStackView {
     override var isFlipped: Bool { true }
 }
 
-final class RoundedView: NSView {
+class RoundedView: NSView {
     init(fill: NSColor, border: NSColor, radius: CGFloat = 10) {
         super.init(frame: .zero)
         wantsLayer = true
@@ -1191,6 +1768,62 @@ final class RoundedView: NSView {
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+    }
+}
+
+final class ClickableCardView: RoundedView {
+    var onClick: (() -> Void)?
+
+    override init(fill: NSColor, border: NSColor, radius: CGFloat = 10) {
+        super.init(fill: fill, border: border, radius: radius)
+        addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(handleClick)))
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    @objc private func handleClick() {
+        onClick?()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+final class RequestBarsView: NSView {
+    private let buckets: [RecentRequestBucket]
+
+    init(buckets: [RecentRequestBucket]) {
+        self.buckets = buckets
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        self.buckets = []
+        super.init(coder: coder)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let visible = Array(buckets.suffix(16))
+        guard !visible.isEmpty else { return }
+        let maxValue = max(visible.map { $0.success + $0.failed }.max() ?? 1, 1)
+        let gap: CGFloat = 2
+        let count = CGFloat(visible.count)
+        let barWidth = max(1, (bounds.width - gap * (count - 1)) / count)
+        for (index, bucket) in visible.enumerated() {
+            let total = bucket.success + bucket.failed
+            let height = max(2, bounds.height * CGFloat(total) / CGFloat(maxValue))
+            let x = CGFloat(index) * (barWidth + gap)
+            let color: NSColor = bucket.failed > 0 ? .systemOrange : .systemTeal
+            color.setFill()
+            NSBezierPath(
+                roundedRect: NSRect(x: x, y: 0, width: barWidth, height: height),
+                xRadius: 1.5,
+                yRadius: 1.5
+            ).fill()
+        }
     }
 }
 

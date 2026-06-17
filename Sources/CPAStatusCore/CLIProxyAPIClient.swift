@@ -38,7 +38,7 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     public func fetchPoolSnapshot() async throws -> PoolSnapshot {
-        let allAuthFiles = try await fetchAuthFiles()
+        let (allAuthFiles, details) = try await fetchAuthFilesAndDetails()
         let now = Date()
 
         let grouped = Dictionary(grouping: allAuthFiles) { auth -> String in
@@ -54,9 +54,9 @@ public struct CLIProxyAPIClient: Sendable {
             }
             let accounts: [AccountQuota]
             if providerInfo.supportsUsage {
-                accounts = await fetchAccountQuotas(sortedFiles)
+                accounts = await fetchAccountQuotas(sortedFiles, details: details)
             } else {
-                accounts = sortedFiles.map { AccountQuota(auth: $0, usage: nil, errorMessage: nil) }
+                accounts = sortedFiles.map { AccountQuota(auth: $0, usage: nil, errorMessage: nil, detail: details[$0.id]) }
             }
             pools.append(ProviderPool(provider: providerInfo, accounts: accounts, fetchedAt: now))
         }
@@ -72,6 +72,12 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     public func fetchAuthFiles() async throws -> [AuthFile] {
+        try await fetchAuthFilesAndDetails().files
+    }
+
+    /// Fetches the auth-files list once, decoding both the typed `AuthFile` list (for the
+    /// dashboard) and a lenient `AccountDetail` per account (for the detail view), paired by index.
+    private func fetchAuthFilesAndDetails() async throws -> (files: [AuthFile], details: [String: AccountDetail]) {
         guard settings.isConfigured else {
             throw PoolClientError.notConfigured
         }
@@ -82,8 +88,46 @@ public struct CLIProxyAPIClient: Sendable {
         applyManagementHeaders(to: &request)
 
         let data = try await data(for: request)
-        let decoder = JSONDecoder()
-        return try decoder.decode(AuthFilesResponse.self, from: data).files
+        let files = try JSONDecoder().decode(AuthFilesResponse.self, from: data).files
+
+        var details: [String: AccountDetail] = [:]
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let rawFiles = root["files"] as? [Any] {
+            for (index, raw) in rawFiles.enumerated() where index < files.count {
+                guard let dict = raw as? [String: Any] else { continue }
+                details[files[index].id] = AccountDetail(dict: dict)
+            }
+        }
+        return (files, details)
+    }
+
+    public func fetchModels(for auth: AuthFile) async throws -> [CPAModelDefinition] {
+        guard settings.isConfigured else {
+            throw PoolClientError.notConfigured
+        }
+        let queryName = auth.name.isEmpty ? auth.id : auth.name
+        var components = URLComponents(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/models"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "name", value: queryName)]
+        guard let url = components?.url else {
+            throw PoolClientError.invalidResponse("invalid models URL")
+        }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        return try JSONDecoder().decode(ModelsResponse.self, from: data).models
+    }
+
+    /// Re-fetches live quota for a single account (used by the detail screen's refresh button).
+    /// Carries the previously parsed `detail` through unchanged.
+    public func refreshUsage(for auth: AuthFile, detail: AccountDetail? = nil) async -> AccountQuota {
+        guard ProviderCatalog.info(for: auth.normalizedProvider).supportsUsage else {
+            return AccountQuota(auth: auth, usage: nil, errorMessage: nil, detail: detail)
+        }
+        return await quota(for: auth, detail: detail)
     }
 
     public static func managementURL(baseURL: String, path: String) throws -> URL {
@@ -111,7 +155,7 @@ public struct CLIProxyAPIClient: Sendable {
         return url
     }
 
-    private func fetchAccountQuotas(_ authFiles: [AuthFile]) async -> [AccountQuota] {
+    private func fetchAccountQuotas(_ authFiles: [AuthFile], details: [String: AccountDetail]) async -> [AccountQuota] {
         guard !authFiles.isEmpty else {
             return []
         }
@@ -123,8 +167,9 @@ public struct CLIProxyAPIClient: Sendable {
             let batch = Array(authFiles[start..<Swift.min(start + batchSize, authFiles.count)])
             let results = await withTaskGroup(of: AccountQuota.self, returning: [AccountQuota].self) { group in
                 for auth in batch {
+                    let detail = details[auth.id]
                     group.addTask {
-                        await quota(for: auth)
+                        await quota(for: auth, detail: detail)
                     }
                 }
                 var values: [AccountQuota] = []
@@ -142,19 +187,19 @@ public struct CLIProxyAPIClient: Sendable {
         }
     }
 
-    private func quota(for auth: AuthFile) async -> AccountQuota {
+    private func quota(for auth: AuthFile, detail: AccountDetail? = nil) async -> AccountQuota {
         if auth.authIndex.isEmpty {
-            return AccountQuota(auth: auth, usage: nil, errorMessage: "missing auth_index")
+            return AccountQuota(auth: auth, usage: nil, errorMessage: "missing auth_index", detail: detail)
         }
         if auth.disabled {
-            return AccountQuota(auth: auth, usage: nil, errorMessage: nil)
+            return AccountQuota(auth: auth, usage: nil, errorMessage: nil, detail: detail)
         }
 
         do {
             let usage = try await fetchUsage(auth: auth)
-            return AccountQuota(auth: auth, usage: usage, errorMessage: nil)
+            return AccountQuota(auth: auth, usage: usage, errorMessage: nil, detail: detail)
         } catch {
-            return AccountQuota(auth: auth, usage: nil, errorMessage: error.localizedDescription)
+            return AccountQuota(auth: auth, usage: nil, errorMessage: error.localizedDescription, detail: detail)
         }
     }
 
