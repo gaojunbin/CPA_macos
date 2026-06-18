@@ -17,28 +17,43 @@ enum CPAStatusBarMain {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let store = SettingsStore.shared
-    private var settings = AppSettings()
+    private let store = ServiceProfileStore.shared
+    private var profiles: [ServiceProfile] = []
+    private var selectedID: UUID?
+    private var snapshotCache: [UUID: PoolSnapshot] = [:]
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let controller = PopoverViewController()
     private var refreshTask: Task<Void, Never>?
+    private var refreshGeneration = 0
     private var timer: Timer?
 
+    private var selectedProfile: ServiceProfile? {
+        profiles.first { $0.id == selectedID }
+    }
+
+    private var settings: AppSettings {
+        selectedProfile.map { store.settings(for: $0) } ?? AppSettings(baseURL: "", managementKey: "")
+    }
+
+    private var isConfigured: Bool {
+        settings.isConfigured
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        settings = store.load()
+        loadProfiles()
         configureStatusItem()
         configurePopover()
-        controller.state.settings = settings
-        controller.state.screen = settings.isConfigured ? .dashboard : .settings
+        syncControllerState()
+        controller.state.screen = isConfigured ? .dashboard : .services
         controller.render()
 
-        if settings.isConfigured {
+        if isConfigured {
             refresh()
             restartTimer()
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                self.showPopover(screen: .settings, refreshWhenVisible: false)
+                self.showPopover(screen: .services, refreshWhenVisible: false)
             }
         }
     }
@@ -46,6 +61,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         refreshTask?.cancel()
         timer?.invalidate()
+    }
+
+    private func loadProfiles() {
+        profiles = store.loadProfiles()
+        selectedID = store.selectedID()
+        if selectedID == nil || !profiles.contains(where: { $0.id == selectedID }) {
+            selectedID = profiles.first?.id
+            store.setSelectedID(selectedID)
+        }
+    }
+
+    private func syncControllerState() {
+        controller.state.profiles = profiles
+        controller.state.selectedID = selectedID
+        controller.state.settings = settings
     }
 
     private func configureStatusItem() {
@@ -67,19 +97,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onRefresh = { [weak self] in
             self?.refresh()
         }
-        controller.onOpenSettings = { [weak self] in
-            self?.showPopover(screen: .settings, refreshWhenVisible: false)
+        controller.onOpenServices = { [weak self] in
+            self?.showServices()
         }
-        controller.onCloseSettings = { [weak self] in
+        controller.onCloseServices = { [weak self] in
             guard let self else { return }
-            if self.settings.isConfigured {
+            if self.isConfigured {
                 self.controller.state.screen = .dashboard
                 self.controller.state.errorMessage = nil
                 self.controller.render()
             }
         }
-        controller.onSaveSettings = { [weak self] newSettings in
-            self?.save(newSettings)
+        controller.onSelectProfile = { [weak self] id in
+            self?.selectProfile(id)
+        }
+        controller.onSaveProfile = { [weak self] draft in
+            self?.saveProfile(draft)
+        }
+        controller.onDeleteProfile = { [weak self] id in
+            self?.deleteProfile(id)
         }
         controller.onQuit = {
             NSApp.terminate(nil)
@@ -91,12 +127,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
             return
         }
-        showPopover(screen: settings.isConfigured ? .dashboard : .settings, refreshWhenVisible: settings.isConfigured)
+        showPopover(screen: isConfigured ? .dashboard : .services, refreshWhenVisible: isConfigured)
     }
 
     private func showPopover(screen: PopoverScreen, refreshWhenVisible: Bool) {
         controller.state.screen = screen
-        controller.state.settings = settings
+        syncControllerState()
         controller.render()
         guard let button = statusItem.button else { return }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -106,31 +142,142 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func save(_ newSettings: AppSettings) {
-        do {
-            let interval = max(60, min(newSettings.refreshIntervalSeconds, 86_400))
-            settings = AppSettings(
-                baseURL: newSettings.baseURL,
-                managementKey: newSettings.managementKey,
-                refreshIntervalSeconds: interval
-            )
-            try store.save(settings)
-            controller.state.settings = settings
-            controller.state.screen = .dashboard
-            controller.state.errorMessage = nil
+    private func showServices() {
+        controller.state.screen = .services
+        controller.state.editingProfile = nil
+        controller.state.errorMessage = nil
+        syncControllerState()
+        controller.render()
+    }
+
+    private func selectProfile(_ id: UUID) {
+        guard id != selectedID, profiles.contains(where: { $0.id == id }) else {
+            return
+        }
+        selectedID = id
+        store.setSelectedID(id)
+        syncControllerState()
+        // Show the newly selected service's cached snapshot instantly, then refresh.
+        controller.state.snapshot = snapshotCache[id]
+        controller.state.errorMessage = nil
+        controller.state.detailAccount = nil
+        controller.state.screen = .dashboard
+        controller.render()
+        updateStatusTitle()
+        restartTimer()
+        refresh()
+    }
+
+    private func saveProfile(_ draft: ServiceDraft) {
+        let trimmedURL = draft.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = draft.managementKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty else {
+            controller.state.errorMessage = "请输入服务器地址"
             controller.render()
-            updateStatusTitle()
-            restartTimer()
-            refresh()
+            return
+        }
+        let interval = max(60, min(draft.refreshIntervalSeconds, 86_400))
+        let savedID: UUID
+
+        do {
+            if let id = draft.id, let index = profiles.firstIndex(where: { $0.id == id }) {
+                if !trimmedKey.isEmpty {
+                    try store.saveManagementKey(trimmedKey, for: id)
+                } else if store.managementKey(for: id).isEmpty {
+                    controller.state.errorMessage = "请输入管理密钥"
+                    controller.render()
+                    return
+                }
+                var profile = profiles[index]
+                profile.name = resolvedName(draft.name, baseURL: trimmedURL)
+                profile.baseURL = trimmedURL
+                profile.refreshIntervalSeconds = interval
+                profiles[index] = profile
+                store.saveProfiles(profiles)
+                savedID = id
+            } else {
+                guard !trimmedKey.isEmpty else {
+                    controller.state.errorMessage = "请输入管理密钥"
+                    controller.render()
+                    return
+                }
+                let profile = ServiceProfile(
+                    name: resolvedName(draft.name, baseURL: trimmedURL),
+                    baseURL: trimmedURL,
+                    refreshIntervalSeconds: interval
+                )
+                try store.saveManagementKey(trimmedKey, for: profile.id)
+                profiles.append(profile)
+                store.saveProfiles(profiles)
+                savedID = profile.id
+                if selectedID == nil {
+                    selectedID = profile.id
+                    store.setSelectedID(profile.id)
+                }
+            }
         } catch {
             controller.state.errorMessage = error.localizedDescription
+            controller.render()
+            return
+        }
+
+        syncControllerState()
+        controller.state.errorMessage = nil
+        controller.state.editingProfile = nil
+        restartTimer()
+        updateStatusTitle()
+        if savedID == selectedID {
+            controller.state.snapshot = snapshotCache[savedID]
+            controller.state.screen = .dashboard
+            controller.render()
+            refresh()
+        } else {
+            controller.state.screen = .services
             controller.render()
         }
     }
 
+    private func deleteProfile(_ id: UUID) {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let wasSelected = (id == selectedID)
+        store.deleteManagementKey(for: id)
+        snapshotCache[id] = nil
+        profiles.remove(at: index)
+        store.saveProfiles(profiles)
+        if wasSelected {
+            selectedID = profiles.first?.id
+            store.setSelectedID(selectedID)
+        }
+
+        syncControllerState()
+        controller.state.editingProfile = nil
+        controller.state.errorMessage = nil
+        if wasSelected {
+            controller.state.snapshot = selectedID.flatMap { snapshotCache[$0] }
+        }
+        controller.state.screen = .services
+        controller.render()
+        updateStatusTitle()
+        restartTimer()
+        if wasSelected && isConfigured {
+            refresh()
+        }
+    }
+
+    private func resolvedName(_ name: String, baseURL: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        let raw = baseURL.contains("://") ? baseURL : "https://\(baseURL)"
+        return URL(string: raw)?.host ?? baseURL
+    }
+
     private func restartTimer() {
         timer?.invalidate()
-        guard settings.isConfigured else { return }
+        guard isConfigured else { return }
         timer = Timer.scheduledTimer(withTimeInterval: settings.refreshIntervalSeconds, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refresh()
@@ -139,26 +286,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
-        guard settings.isConfigured else {
-            controller.state.screen = .settings
+        guard isConfigured else {
+            controller.state.screen = .services
             controller.render()
             updateStatusTitle()
             return
         }
-        if refreshTask != nil {
-            return
-        }
+
+        refreshTask?.cancel()
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let targetID = selectedID
+        let snapshotSettings = settings
 
         controller.state.isLoading = true
         controller.state.errorMessage = nil
         controller.render()
         updateStatusTitle()
 
-        let client = CLIProxyAPIClient(settings: settings)
+        let client = CLIProxyAPIClient(settings: snapshotSettings)
         refreshTask = Task {
             do {
                 let snapshot = try await client.fetchPoolSnapshot()
                 await MainActor.run {
+                    guard generation == self.refreshGeneration else { return }
+                    if let targetID { self.snapshotCache[targetID] = snapshot }
                     self.controller.state.snapshot = snapshot
                     self.controller.state.errorMessage = nil
                     self.controller.state.isLoading = false
@@ -168,6 +320,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 await MainActor.run {
+                    guard generation == self.refreshGeneration else { return }
+                    if error is CancellationError {
+                        self.controller.state.isLoading = false
+                        self.refreshTask = nil
+                        return
+                    }
                     self.controller.state.errorMessage = error.localizedDescription
                     self.controller.state.isLoading = false
                     self.refreshTask = nil
@@ -242,12 +400,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 enum PopoverScreen {
     case dashboard
-    case settings
+    case services
+    case serviceEditor
     case detail
+}
+
+/// Form values collected by the service editor and handed back to the app delegate to persist.
+struct ServiceDraft {
+    var id: UUID?
+    var name: String
+    var baseURL: String
+    var managementKey: String
+    var refreshIntervalSeconds: TimeInterval
 }
 
 struct PopoverState {
     var settings = AppSettings()
+    var profiles: [ServiceProfile] = []
+    var selectedID: UUID?
+    var editingProfile: ServiceProfile?
     var snapshot: PoolSnapshot?
     var screen: PopoverScreen = .dashboard
     var isLoading = false
@@ -263,9 +434,11 @@ struct PopoverState {
 final class PopoverViewController: NSViewController {
     var state = PopoverState()
     var onRefresh: (() -> Void)?
-    var onOpenSettings: (() -> Void)?
-    var onCloseSettings: (() -> Void)?
-    var onSaveSettings: ((AppSettings) -> Void)?
+    var onOpenServices: (() -> Void)?
+    var onCloseServices: (() -> Void)?
+    var onSelectProfile: ((UUID) -> Void)?
+    var onSaveProfile: ((ServiceDraft) -> Void)?
+    var onDeleteProfile: ((UUID) -> Void)?
     var onQuit: (() -> Void)?
 
     private let popoverWidth: CGFloat = 380
@@ -308,8 +481,10 @@ final class PopoverViewController: NSViewController {
         switch state.screen {
         case .dashboard:
             renderDashboard(in: root)
-        case .settings:
-            renderSettings(in: root)
+        case .services:
+            renderServices(in: root)
+        case .serviceEditor:
+            renderServiceEditor(in: root)
         case .detail:
             renderDetail(in: root)
         }
@@ -340,7 +515,9 @@ final class PopoverViewController: NSViewController {
         }
     }
 
-    private func renderSettings(in root: NSStackView) {
+    // MARK: - Services list
+
+    private func renderServices(in root: NSStackView) {
         let titleRow = NSStackView()
         titleRow.orientation = .horizontal
         titleRow.alignment = .top
@@ -350,24 +527,163 @@ final class PopoverViewController: NSViewController {
         titleStack.orientation = .vertical
         titleStack.alignment = .leading
         titleStack.spacing = 2
-        titleStack.addArrangedSubview(label("Settings", font: .systemFont(ofSize: 18, weight: .semibold), color: .labelColor))
-        titleStack.addArrangedSubview(label("Where to reach your pool.", font: .systemFont(ofSize: 12), color: .secondaryLabelColor))
+        titleStack.addArrangedSubview(label("服务", font: .systemFont(ofSize: 18, weight: .semibold), color: .labelColor))
+        titleStack.addArrangedSubview(label("管理你的号池，互不交集。", font: .systemFont(ofSize: 12), color: .secondaryLabelColor))
         titleRow.addArrangedSubview(titleStack)
         titleRow.addArrangedSubview(NSView())
 
         if state.settings.isConfigured {
             titleRow.addArrangedSubview(circularIconButton(symbol: "xmark", tooltip: "Close") { [weak self] in
-                self?.onCloseSettings?()
+                self?.onCloseServices?()
             })
         }
         addFullWidth(titleRow, to: root)
 
-        let urlField = NSTextField(string: state.settings.baseURL)
+        if let error = state.errorMessage {
+            addFullWidth(messageView(text: error), to: root)
+        }
+
+        if state.profiles.isEmpty {
+            addFullWidth(placeholderCard(
+                symbol: "tray",
+                title: "还没有服务",
+                detail: "点击下方添加你的第一个服务。"
+            ), to: root)
+        } else {
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .noBorder
+            scroll.drawsBackground = false
+            scroll.scrollerStyle = .overlay
+            scroll.automaticallyAdjustsContentInsets = false
+            scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+            let stack = TopAlignedStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 6
+            stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 4, right: 0)
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            scroll.documentView = stack
+            NSLayoutConstraint.activate([
+                stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+            ])
+
+            for profile in state.profiles {
+                let row = serviceManageRow(profile)
+                stack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+            addFullWidth(scroll, to: root)
+        }
+
+        let addButton = primaryButton(title: "添加服务") { [weak self] in
+            self?.beginAddProfile()
+        }
+        let addRow = NSView()
+        addRow.translatesAutoresizingMaskIntoConstraints = false
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+        addRow.addSubview(addButton)
+        NSLayoutConstraint.activate([
+            addButton.leadingAnchor.constraint(equalTo: addRow.leadingAnchor),
+            addButton.topAnchor.constraint(equalTo: addRow.topAnchor),
+            addButton.bottomAnchor.constraint(equalTo: addRow.bottomAnchor)
+        ])
+        addFullWidth(addRow, to: root)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        root.addArrangedSubview(spacer)
+
+        let quitLink = linkButton(title: "Quit") { [weak self] in
+            self?.onQuit?()
+        }
+        addFullWidth(quitLink, to: root)
+    }
+
+    private func serviceManageRow(_ profile: ServiceProfile) -> NSView {
+        let card = clickableCardView()
+        card.onClick = { [weak self] in self?.beginEditProfile(profile) }
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10)
+        ])
+
+        let isSelected = profile.id == state.selectedID
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        let markName = isSelected ? "checkmark.circle.fill" : "circle"
+        let mark = NSImageView(image: NSImage(systemSymbolName: markName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfig) ?? NSImage())
+        mark.contentTintColor = isSelected ? .controlAccentColor : .tertiaryLabelColor
+        mark.translatesAutoresizingMaskIntoConstraints = false
+        row.addArrangedSubview(mark)
+
+        let textStack = NSStackView()
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        let name = label(profile.name, font: .systemFont(ofSize: 13, weight: .medium), color: .labelColor)
+        name.lineBreakMode = .byTruncatingMiddle
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textStack.addArrangedSubview(name)
+        let host = label(profile.displayHost, font: .systemFont(ofSize: 11, weight: .regular), color: .secondaryLabelColor)
+        host.lineBreakMode = .byTruncatingMiddle
+        host.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textStack.addArrangedSubview(host)
+        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(textStack)
+        row.addArrangedSubview(NSView())
+
+        if isSelected {
+            row.addArrangedSubview(pillLabel("当前", color: .controlAccentColor))
+        }
+
+        let chevron = NSImageView(image: NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)) ?? NSImage())
+        chevron.contentTintColor = .tertiaryLabelColor
+        row.addArrangedSubview(chevron)
+        return card
+    }
+
+    // MARK: - Service editor
+
+    private func renderServiceEditor(in root: NSStackView) {
+        let editing = state.editingProfile
+
+        let headerRow = NSStackView()
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 8
+        headerRow.addArrangedSubview(circularIconButton(symbol: "chevron.left", tooltip: "Back") { [weak self] in
+            self?.backToServices()
+        })
+        headerRow.addArrangedSubview(label(
+            editing == nil ? "添加服务" : "编辑服务",
+            font: .systemFont(ofSize: 16, weight: .semibold),
+            color: .labelColor
+        ))
+        headerRow.addArrangedSubview(NSView())
+        addFullWidth(headerRow, to: root)
+
+        let nameField = NSTextField(string: editing?.name ?? "")
+        nameField.placeholderString = "例如：美国号池"
+        let urlField = NSTextField(string: editing?.baseURL ?? "")
         urlField.placeholderString = "https://your-vps.example.com"
         let keyField = NSSecureTextField(frame: .zero)
-        keyField.stringValue = state.settings.managementKey
-        keyField.placeholderString = "Management password"
-        let minutes = max(1, Int((state.settings.refreshIntervalSeconds / 60).rounded()))
+        keyField.stringValue = ""
+        keyField.placeholderString = editing == nil ? "Management password" : "留空保持当前密钥"
+        let minutes = max(1, Int(((editing?.refreshIntervalSeconds ?? 300) / 60).rounded()))
         let intervalField = NSTextField(string: String(minutes))
         intervalField.placeholderString = "5"
 
@@ -385,36 +701,36 @@ final class PopoverViewController: NSViewController {
             formStack.bottomAnchor.constraint(equalTo: formCard.bottomAnchor, constant: -14)
         ])
 
-        let endpointRow = settingRow(
-            symbol: "network",
-            title: "Endpoint",
-            field: urlField,
-            stretch: true
-        )
-        let passwordRow = settingRow(
-            symbol: "lock.fill",
-            title: "Password",
-            field: keyField,
-            stretch: true
-        )
-        let refreshRow = settingRow(
-            symbol: "arrow.triangle.2.circlepath",
-            title: "Refresh interval",
-            field: intervalField,
-            stretch: false,
-            fieldWidth: 64,
-            suffix: "minutes"
-        )
-
-        [endpointRow, passwordRow, refreshRow].forEach { row in
+        let rows = [
+            settingRow(symbol: "tag", title: "Name", field: nameField, stretch: true),
+            settingRow(symbol: "network", title: "Endpoint", field: urlField, stretch: true),
+            settingRow(symbol: "lock.fill", title: "Password", field: keyField, stretch: true),
+            settingRow(symbol: "arrow.triangle.2.circlepath", title: "Refresh interval", field: intervalField, stretch: false, fieldWidth: 64, suffix: "minutes")
+        ]
+        rows.forEach { row in
             formStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: formStack.widthAnchor).isActive = true
         }
-
         addFullWidth(formCard, to: root)
 
         if let error = state.errorMessage {
             addFullWidth(messageView(text: error), to: root)
+        }
+
+        if let editing, editing.id != state.selectedID {
+            let selectButton = primaryButton(title: "设为当前服务") { [weak self] in
+                self?.onSelectProfile?(editing.id)
+            }
+            let selectRow = NSView()
+            selectRow.translatesAutoresizingMaskIntoConstraints = false
+            selectButton.translatesAutoresizingMaskIntoConstraints = false
+            selectRow.addSubview(selectButton)
+            NSLayoutConstraint.activate([
+                selectButton.leadingAnchor.constraint(equalTo: selectRow.leadingAnchor),
+                selectButton.topAnchor.constraint(equalTo: selectRow.topAnchor),
+                selectButton.bottomAnchor.constraint(equalTo: selectRow.bottomAnchor)
+            ])
+            addFullWidth(selectRow, to: root)
         }
 
         let spacer = NSView()
@@ -422,35 +738,63 @@ final class PopoverViewController: NSViewController {
         spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
         root.addArrangedSubview(spacer)
 
-        let saveButton = primaryButton(title: "Save") { [weak urlField, weak keyField, weak intervalField, weak self] in
+        let saveButton = primaryButton(title: "保存") { [weak nameField, weak urlField, weak keyField, weak intervalField, weak self] in
             guard let self else { return }
             let intervalMinutes = Double(intervalField?.stringValue ?? "") ?? 5
-            self.onSaveSettings?(AppSettings(
+            self.onSaveProfile?(ServiceDraft(
+                id: editing?.id,
+                name: nameField?.stringValue ?? "",
                 baseURL: urlField?.stringValue ?? "",
                 managementKey: keyField?.stringValue ?? "",
                 refreshIntervalSeconds: max(1, intervalMinutes) * 60
             ))
         }
 
-        let quitLink = linkButton(title: "Quit") { [weak self] in
-            self?.onQuit?()
-        }
-
         let buttonRow = NSView()
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
-        quitLink.translatesAutoresizingMaskIntoConstraints = false
         saveButton.translatesAutoresizingMaskIntoConstraints = false
-        buttonRow.addSubview(quitLink)
         buttonRow.addSubview(saveButton)
         NSLayoutConstraint.activate([
-            quitLink.leadingAnchor.constraint(equalTo: buttonRow.leadingAnchor),
-            quitLink.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
             saveButton.trailingAnchor.constraint(equalTo: buttonRow.trailingAnchor),
             saveButton.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
             buttonRow.heightAnchor.constraint(equalTo: saveButton.heightAnchor)
         ])
 
+        if let editing {
+            let deleteLink = linkButton(title: "删除服务") { [weak self] in
+                self?.onDeleteProfile?(editing.id)
+            }
+            deleteLink.contentTintColor = .systemRed
+            deleteLink.translatesAutoresizingMaskIntoConstraints = false
+            buttonRow.addSubview(deleteLink)
+            NSLayoutConstraint.activate([
+                deleteLink.leadingAnchor.constraint(equalTo: buttonRow.leadingAnchor),
+                deleteLink.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor)
+            ])
+        }
+
         addFullWidth(buttonRow, to: root)
+    }
+
+    private func beginAddProfile() {
+        state.editingProfile = nil
+        state.errorMessage = nil
+        state.screen = .serviceEditor
+        render()
+    }
+
+    private func beginEditProfile(_ profile: ServiceProfile) {
+        state.editingProfile = profile
+        state.errorMessage = nil
+        state.screen = .serviceEditor
+        render()
+    }
+
+    private func backToServices() {
+        state.editingProfile = nil
+        state.errorMessage = nil
+        state.screen = .services
+        render()
     }
 
     private func settingRow(
@@ -541,7 +885,7 @@ final class PopoverViewController: NSViewController {
         titleStack.orientation = .vertical
         titleStack.alignment = .leading
         titleStack.spacing = 1
-        titleStack.addArrangedSubview(label("AI Usage", font: .systemFont(ofSize: 18, weight: .semibold), color: .labelColor))
+        titleStack.addArrangedSubview(serviceSwitcherButton())
         titleStack.addArrangedSubview(label(subtitleText(), font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
         row.addArrangedSubview(titleStack)
         row.addArrangedSubview(NSView())
@@ -552,12 +896,52 @@ final class PopoverViewController: NSViewController {
         refresh.isEnabled = !state.isLoading
         row.addArrangedSubview(refresh)
 
-        let settings = circularIconButton(symbol: "gearshape", tooltip: "Settings") { [weak self] in
-            self?.onOpenSettings?()
+        let settings = circularIconButton(symbol: "gearshape", tooltip: "管理服务") { [weak self] in
+            self?.onOpenServices?()
         }
         row.addArrangedSubview(settings)
 
         return row
+    }
+
+    /// The current-service title that doubles as the switcher: clicking it pops a menu of
+    /// every service plus a "管理服务…" entry.
+    private func serviceSwitcherButton() -> NSView {
+        guard !state.profiles.isEmpty else {
+            return label("AI Usage", font: .systemFont(ofSize: 18, weight: .semibold), color: .labelColor)
+        }
+        let currentName = state.profiles.first(where: { $0.id == state.selectedID })?.name ?? "选择服务"
+        let button = CallbackButton(title: currentName, callback: {})
+        button.bezelStyle = .texturedRounded
+        button.font = .systemFont(ofSize: 15, weight: .semibold)
+        let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+        button.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "切换服务")?
+            .withSymbolConfiguration(config)
+        button.imagePosition = .imageRight
+        button.contentTintColor = .labelColor
+        button.toolTip = "切换服务"
+        button.onClick = { [weak self, weak button] in
+            guard let self, let button else { return }
+            self.showServiceMenu(from: button)
+        }
+        return button
+    }
+
+    private func showServiceMenu(from view: NSView) {
+        let menu = NSMenu()
+        for profile in state.profiles {
+            let item = CallbackMenuItem(title: profile.name) { [weak self] in
+                self?.onSelectProfile?(profile.id)
+            }
+            item.state = (profile.id == state.selectedID) ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        menu.addItem(CallbackMenuItem(title: "管理服务…") { [weak self] in
+            self?.onOpenServices?()
+        })
+        let location = NSPoint(x: 0, y: view.bounds.height + 4)
+        menu.popUp(positioning: nil, at: location, in: view)
     }
 
     private func summaryView(_ summary: PoolSummary) -> NSView {
@@ -1729,10 +2113,10 @@ final class PopoverViewController: NSViewController {
 
 @MainActor
 final class CallbackButton: NSButton {
-    private var callback: (() -> Void)?
+    var onClick: (() -> Void)?
 
     init(title: String, callback: @escaping () -> Void) {
-        self.callback = callback
+        self.onClick = callback
         super.init(frame: .zero)
         self.title = title
         self.bezelStyle = .rounded
@@ -1746,7 +2130,26 @@ final class CallbackButton: NSButton {
     }
 
     @objc private func runCallback() {
-        callback?()
+        onClick?()
+    }
+}
+
+@MainActor
+final class CallbackMenuItem: NSMenuItem {
+    private let callback: () -> Void
+
+    init(title: String, callback: @escaping () -> Void) {
+        self.callback = callback
+        super.init(title: title, action: #selector(runCallback), keyEquivalent: "")
+        self.target = self
+    }
+
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func runCallback() {
+        callback()
     }
 }
 

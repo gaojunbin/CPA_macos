@@ -19,13 +19,24 @@ CLIProxyAPI replaces `Bearer $TOKEN$` server-side, so the app never needs accoun
 swift run CPAStatusBar
 ```
 
-On first launch, click the menu bar icon and configure:
+On first launch, click the menu bar icon and add your first service:
 
+- Name (optional, defaults to the host)
 - Web endpoint, for example `https://your-vps.example.com` or `http://127.0.0.1:8317`
 - Management password
 - Auto-refresh interval in minutes
 
-The management password is stored in macOS Keychain.
+The management password is stored in macOS Keychain. You can add more services and switch between them at any time (see **Multiple services**).
+
+## Multiple services
+
+The app can connect to multiple CLIProxyAPI services ("号池" / pools) and switch between them instantly. Services are fully independent and never share data.
+
+- The dashboard title doubles as a switcher: click the current service name to pick another service, or choose **管理服务… (Manage services)**.
+- **Manage services** lists every service; click one to edit it, or **添加服务 (Add service)** to create another. Each service keeps its own endpoint, management password, and refresh interval.
+- Each service's management password is stored separately in the macOS Keychain, keyed per service.
+- The menu bar shows the quota of the currently selected service. Switching shows that service's last-loaded data instantly while a fresh refresh runs in the background.
+- Upgrading from a single-service build automatically migrates your existing connection into the first service.
 
 ## Build a macOS app bundle
 

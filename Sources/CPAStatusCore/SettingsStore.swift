@@ -1,43 +1,8 @@
 import Foundation
 import Security
 
-public final class SettingsStore {
-    public static let shared = SettingsStore()
-
-    private let defaults: UserDefaults
-    private let keychain: KeychainStore
-
-    private enum Keys {
-        static let baseURL = "baseURL"
-        static let refreshIntervalSeconds = "refreshIntervalSeconds"
-    }
-
-    public init(
-        defaults: UserDefaults = .standard,
-        keychain: KeychainStore = KeychainStore(service: "com.local.CPAStatusBar", account: "management-key")
-    ) {
-        self.defaults = defaults
-        self.keychain = keychain
-    }
-
-    public func load() -> AppSettings {
-        let baseURL = defaults.string(forKey: Keys.baseURL) ?? "http://127.0.0.1:8317"
-        let interval = defaults.double(forKey: Keys.refreshIntervalSeconds)
-        let key = (try? keychain.read()) ?? ""
-        return AppSettings(
-            baseURL: baseURL,
-            managementKey: key,
-            refreshIntervalSeconds: interval > 0 ? interval : 300
-        )
-    }
-
-    public func save(_ settings: AppSettings) throws {
-        defaults.set(settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.baseURL)
-        defaults.set(settings.refreshIntervalSeconds, forKey: Keys.refreshIntervalSeconds)
-        try keychain.save(settings.managementKey.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-}
-
+// Keychain access used by `ServiceProfileStore` (one entry per service). The previous
+// single-service `SettingsStore` was replaced by the multi-service store.
 public struct KeychainStore {
     public let service: String
     public let account: String
