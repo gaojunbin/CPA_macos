@@ -120,6 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onQuit = {
             NSApp.terminate(nil)
         }
+        controller.onHoldOpen = { [weak self] hold in
+            // `.applicationDefined` keeps the popover up while the user is in the browser;
+            // `.transient` restores the normal click-outside-to-close behavior afterwards.
+            self?.popover.behavior = hold ? .applicationDefined : .transient
+        }
     }
 
     @objc private func togglePopover() {
@@ -403,6 +408,24 @@ enum PopoverScreen {
     case services
     case serviceEditor
     case detail
+    case addAccount
+    case apiKeys
+}
+
+/// Tracks an in-flight OAuth login started from the menu bar.
+struct OAuthFlow {
+    enum Phase {
+        case requesting      // fetching the auth URL
+        case waitingBrowser  // browser open, waiting for the loopback redirect
+        case authorizing     // device-flow: waiting for the user to approve in the browser
+        case finishing       // callback relayed, polling the server for completion
+        case failed
+    }
+    let provider: OAuthProvider
+    var phase: Phase
+    var authURL: String?
+    var sessionState: String?
+    var errorMessage: String?
 }
 
 /// Form values collected by the service editor and handed back to the app delegate to persist.
@@ -428,6 +451,16 @@ struct PopoverState {
     var detailModelsLoading = false
     var detailModelsError: String?
     var detailRefreshing = false
+    // OAuth login
+    var oauth: OAuthFlow?
+    // API keys
+    var apiKeys: [String]?
+    var apiKeysLoading = false
+    var apiKeysError: String?
+    var apiKeyAdding = false
+    var pendingDeleteKey: String?
+    // Transient confirmation toast (e.g. "已复制").
+    var toast: String?
 }
 
 @MainActor
@@ -440,9 +473,16 @@ final class PopoverViewController: NSViewController {
     var onSaveProfile: ((ServiceDraft) -> Void)?
     var onDeleteProfile: ((UUID) -> Void)?
     var onQuit: (() -> Void)?
+    /// Asks the app delegate to keep the popover open across the browser hand-off during OAuth.
+    var onHoldOpen: ((Bool) -> Void)?
 
     private let popoverWidth: CGFloat = 380
     private let popoverHeight: CGFloat = 560
+
+    // OAuth flow coordination.
+    private var oauthTask: Task<Void, Never>?
+    private var oauthGeneration = 0
+    private var toastToken = 0
 
     override func loadView() {
         let frame = NSRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight)
@@ -487,7 +527,75 @@ final class PopoverViewController: NSViewController {
             renderServiceEditor(in: root)
         case .detail:
             renderDetail(in: root)
+        case .addAccount:
+            renderAddAccount(in: root)
+        case .apiKeys:
+            renderAPIKeys(in: root)
         }
+
+        if let toast = state.toast {
+            addToastOverlay(toast)
+        }
+    }
+
+    // MARK: - Toast
+
+    /// Shows a brief floating confirmation pinned to the top of the popover, auto-dismissed.
+    private func showToast(_ message: String) {
+        state.toast = message
+        toastToken += 1
+        let token = toastToken
+        render()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            guard let self, self.toastToken == token else { return }
+            self.state.toast = nil
+            self.render()
+        }
+    }
+
+    private func addToastOverlay(_ message: String) {
+        let pill = RoundedView(fill: NSColor.controlAccentColor, border: .clear, radius: 9)
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.shadow = {
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            shadow.shadowBlurRadius = 6
+            return shadow
+        }()
+        pill.wantsLayer = true
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .bold)
+        let icon = NSImageView(image: NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) ?? NSImage())
+        icon.contentTintColor = .white
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(label(message, font: .systemFont(ofSize: 12, weight: .semibold), color: .white))
+        pill.addSubview(row)
+        view.addSubview(pill)
+
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -12),
+            row.topAnchor.constraint(equalTo: pill.topAnchor, constant: 7),
+            row.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -7),
+            pill.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            pill.topAnchor.constraint(equalTo: view.topAnchor, constant: 12)
+        ])
+    }
+
+    private func copyToClipboard(_ value: String, notice: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(trimmed, forType: .string)
+        showToast(notice)
     }
 
     private func addFullWidth(_ subview: NSView, to stack: NSStackView) {
@@ -896,12 +1004,55 @@ final class PopoverViewController: NSViewController {
         refresh.isEnabled = !state.isLoading
         row.addArrangedSubview(refresh)
 
-        let settings = circularIconButton(symbol: "gearshape", tooltip: "管理服务") { [weak self] in
-            self?.onOpenServices?()
+        weak var manageRef: NSButton?
+        let manage = circularIconButton(symbol: "ellipsis.circle", tooltip: "管理") { [weak self] in
+            guard let self, let anchor = manageRef else { return }
+            self.showManageMenu(from: anchor)
         }
-        row.addArrangedSubview(settings)
+        manageRef = manage
+        row.addArrangedSubview(manage)
 
         return row
+    }
+
+    private func showManageMenu(from view: NSView) {
+        let menu = NSMenu()
+        menu.addItem(CallbackMenuItem(title: "添加账号（OAuth 登录）") { [weak self] in
+            self?.openAddAccount()
+        })
+        menu.addItem(CallbackMenuItem(title: "API 密钥…") { [weak self] in
+            self?.openAPIKeys()
+        })
+        menu.addItem(.separator())
+        menu.addItem(CallbackMenuItem(title: "管理服务…") { [weak self] in
+            self?.onOpenServices?()
+        })
+        menu.addItem(.separator())
+        menu.addItem(CallbackMenuItem(title: "退出 CPA") { [weak self] in
+            self?.onQuit?()
+        })
+        let location = NSPoint(x: 0, y: view.bounds.height + 4)
+        menu.popUp(positioning: nil, at: location, in: view)
+    }
+
+    private func openAddAccount() {
+        oauthGeneration += 1
+        cleanupOAuthResources()
+        onHoldOpen?(false)
+        state.oauth = nil
+        state.errorMessage = nil
+        state.screen = .addAccount
+        render()
+    }
+
+    private func openAPIKeys() {
+        state.screen = .apiKeys
+        state.pendingDeleteKey = nil
+        state.apiKeyAdding = false
+        state.apiKeys = nil   // avoid flashing another service's keys before the reload lands
+        state.apiKeysError = nil
+        render()
+        loadAPIKeys()
     }
 
     /// The current-service title that doubles as the switcher: clicking it pops a menu of
@@ -1340,6 +1491,687 @@ final class PopoverViewController: NSViewController {
         return container
     }
 
+    // MARK: - Add account (OAuth login)
+
+    private func renderAddAccount(in root: NSStackView) {
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        header.addArrangedSubview(circularIconButton(symbol: "chevron.left", tooltip: "Back") { [weak self] in
+            guard let self else { return }
+            if self.state.oauth != nil {
+                self.cancelOAuth()
+            } else {
+                self.showDashboard()
+            }
+        })
+        header.addArrangedSubview(label("添加账号", font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor))
+        header.addArrangedSubview(NSView())
+        addFullWidth(header, to: root)
+
+        if let flow = state.oauth {
+            addFullWidth(oauthProgressCard(flow), to: root)
+        } else {
+            addFullWidth(label(
+                "选择渠道登录，账号会保存到当前服务，无需打开网页后台。",
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            ), to: root)
+
+            let listStack = TopAlignedStackView()
+            listStack.orientation = .vertical
+            listStack.alignment = .leading
+            listStack.spacing = 6
+            listStack.translatesAutoresizingMaskIntoConstraints = false
+            for provider in OAuthProvider.allCases {
+                let row = oauthProviderRow(provider)
+                listStack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
+            }
+            addFullWidth(listStack, to: root)
+        }
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        root.addArrangedSubview(spacer)
+    }
+
+    private func oauthProviderRow(_ provider: OAuthProvider) -> NSView {
+        let card = clickableCardView()
+        card.onClick = { [weak self] in self?.startOAuth(provider) }
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10)
+        ])
+
+        row.addArrangedSubview(oauthProviderBadge(provider, size: 28))
+
+        let textStack = NSStackView()
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        textStack.addArrangedSubview(label(provider.displayName, font: .systemFont(ofSize: 13, weight: .medium), color: .labelColor))
+        textStack.addArrangedSubview(label(provider.hint, font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+        row.addArrangedSubview(textStack)
+        row.addArrangedSubview(NSView())
+
+        let plus = NSImageView(image: NSImage(systemSymbolName: "plus.circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)) ?? NSImage())
+        plus.contentTintColor = .controlAccentColor
+        row.addArrangedSubview(plus)
+        return card
+    }
+
+    private func oauthProgressCard(_ flow: OAuthFlow) -> NSView {
+        let card = cardView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+
+        let top = NSStackView()
+        top.orientation = .horizontal
+        top.alignment = .centerY
+        top.spacing = 10
+        top.addArrangedSubview(oauthProviderBadge(flow.provider, size: 30))
+        let titleStack = NSStackView()
+        titleStack.orientation = .vertical
+        titleStack.alignment = .leading
+        titleStack.spacing = 2
+        titleStack.addArrangedSubview(label(flow.provider.displayName, font: .systemFont(ofSize: 14, weight: .semibold), color: .labelColor))
+        titleStack.addArrangedSubview(label("OAuth 登录", font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+        top.addArrangedSubview(titleStack)
+        top.addArrangedSubview(NSView())
+        if flow.phase != .failed {
+            let spinner = NSProgressIndicator()
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            spinner.startAnimation(nil)
+            top.addArrangedSubview(spinner)
+        } else {
+            top.addArrangedSubview(pillLabel("失败", color: .systemRed))
+        }
+        stack.addArrangedSubview(top)
+        top.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let status = label(oauthPhaseText(flow), font: .systemFont(ofSize: 12, weight: .medium),
+                           color: flow.phase == .failed ? .systemRed : .labelColor)
+        status.lineBreakMode = .byWordWrapping
+        status.maximumNumberOfLines = 4
+        status.preferredMaxLayoutWidth = popoverWidth - 88
+        stack.addArrangedSubview(status)
+        status.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // Authorization link: copy is the primary action (the user may use any browser).
+        if let url = flow.authURL, !url.isEmpty {
+            stack.addArrangedSubview(label("① 授权链接", font: .systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor))
+
+            let urlRow = NSStackView()
+            urlRow.orientation = .horizontal
+            urlRow.alignment = .centerY
+            urlRow.spacing = 8
+            urlRow.distribution = .fill
+            urlRow.translatesAutoresizingMaskIntoConstraints = false
+
+            let urlField = NSTextField(string: url)
+            urlField.isEditable = false
+            urlField.isSelectable = true
+            urlField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            urlField.bezelStyle = .roundedBezel
+            urlField.lineBreakMode = .byTruncatingTail
+            urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            urlField.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            urlRow.addArrangedSubview(urlField)
+
+            let copyButton = CallbackButton(title: "复制链接") { [weak self] in
+                self?.copyToClipboard(url, notice: "已复制链接")
+            }
+            copyButton.bezelStyle = .rounded
+            copyButton.setContentHuggingPriority(.required, for: .horizontal)
+            urlRow.addArrangedSubview(copyButton)
+            stack.addArrangedSubview(urlRow)
+            urlRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+            let openLink = linkButton(title: "用默认浏览器打开") { [weak self] in
+                self?.openURL(url)
+            }
+            openLink.contentTintColor = .controlAccentColor
+            stack.addArrangedSubview(openLink)
+        }
+
+        // Redirect providers: the user pastes the redirected localhost URL back here.
+        if !flow.provider.usesDeviceFlow && flow.authURL != nil {
+            stack.addArrangedSubview(label("② 登录后，把浏览器地址栏的回调链接粘贴到这里", font: .systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor))
+
+            let pasteRow = NSStackView()
+            pasteRow.orientation = .horizontal
+            pasteRow.alignment = .centerY
+            pasteRow.spacing = 8
+            pasteRow.distribution = .fill
+            pasteRow.translatesAutoresizingMaskIntoConstraints = false
+            let field = NSTextField(string: "")
+            field.placeholderString = flow.provider.callbackPort.map { "http://localhost:\($0)/…?code=…" } ?? "回调链接"
+            field.font = .systemFont(ofSize: 12)
+            field.bezelStyle = .roundedBezel
+            field.lineBreakMode = .byTruncatingHead
+            field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            field.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            pasteRow.addArrangedSubview(field)
+            let submit = CallbackButton(title: "提交") { [weak self, weak field] in
+                guard let self, let field else { return }
+                self.submitOAuthPaste(field.stringValue)
+            }
+            submit.bezelStyle = .rounded
+            submit.setContentHuggingPriority(.required, for: .horizontal)
+            pasteRow.addArrangedSubview(submit)
+            stack.addArrangedSubview(pasteRow)
+            pasteRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        // Inline error while still recoverable (e.g. a bad paste); failures use the status line.
+        if flow.phase != .failed, let err = flow.errorMessage, !err.isEmpty {
+            let note = noteLabel(text: err, color: .systemRed)
+            stack.addArrangedSubview(note)
+            note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        let buttons = NSStackView()
+        buttons.orientation = .horizontal
+        buttons.alignment = .centerY
+        buttons.spacing = 8
+        if flow.phase == .failed {
+            buttons.addArrangedSubview(primaryButton(title: "重试") { [weak self] in
+                self?.startOAuth(flow.provider)
+            })
+            buttons.addArrangedSubview(linkButton(title: "返回") { [weak self] in
+                self?.cancelOAuth()
+            })
+        } else {
+            buttons.addArrangedSubview(linkButton(title: "取消") { [weak self] in
+                self?.cancelOAuth()
+            })
+        }
+        stack.addArrangedSubview(buttons)
+        return card
+    }
+
+    private func oauthProviderBadge(_ provider: OAuthProvider, size: CGFloat = 30) -> NSView {
+        let info = ProviderCatalog.info(for: provider.catalogKey)
+        let accent = providerAccentColor(info.accentName)
+        let badge = RoundedView(fill: accent.withAlphaComponent(0.16), border: .clear, radius: 7)
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        let config = NSImage.SymbolConfiguration(pointSize: size * 0.45, weight: .semibold)
+        let icon = NSImageView(image: NSImage(systemSymbolName: info.symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) ?? NSImage())
+        icon.contentTintColor = accent
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(icon)
+        NSLayoutConstraint.activate([
+            badge.widthAnchor.constraint(equalToConstant: size),
+            badge.heightAnchor.constraint(equalToConstant: size),
+            icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor)
+        ])
+        return badge
+    }
+
+    private func oauthPhaseText(_ flow: OAuthFlow) -> String {
+        switch flow.phase {
+        case .requesting: return "正在获取授权链接…"
+        case .waitingBrowser: return "复制下面的链接到浏览器登录，再把回调链接粘贴回来。"
+        case .authorizing: return "复制下面的链接到浏览器完成授权，完成后会自动登录。"
+        case .finishing: return "正在验证并保存登录…"
+        case .failed: return flow.errorMessage ?? "登录失败，请重试。"
+        }
+    }
+
+    // MARK: - OAuth flow
+
+    private func startOAuth(_ provider: OAuthProvider) {
+        oauthGeneration += 1
+        let generation = oauthGeneration
+        cleanupOAuthResources()
+        state.oauth = OAuthFlow(provider: provider, phase: .requesting)
+        state.screen = .addAccount
+        render()
+
+        let settings = state.settings
+        oauthTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                let auth = try await client.requestOAuthURL(for: provider)
+                guard self.isCurrentOAuth(generation) else { return }
+                self.state.oauth?.authURL = auth.url
+                self.state.oauth?.sessionState = auth.state
+                // Keep the popover open while the user logs in (in any browser) and returns to paste.
+                self.onHoldOpen?(true)
+                self.state.oauth?.phase = provider.usesDeviceFlow ? .authorizing : .waitingBrowser
+                self.render()
+                // Poll for completion: the device flow (Kimi) finishes on its own; redirect flows
+                // finish once the user pastes the callback URL (see submitOAuthPaste).
+                try await self.pollOAuth(client: client, provider: provider, sessionState: auth.state, generation: generation)
+            } catch {
+                guard self.isCurrentOAuth(generation), !(error is CancellationError) else { return }
+                self.failOAuth(error)
+            }
+        }
+    }
+
+    /// Relays a manually pasted redirect URL to the server. The poll loop started in
+    /// `startOAuth` detects completion, so this only needs to submit the callback.
+    private func submitOAuthPaste(_ urlString: String) {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let flow = state.oauth, !flow.provider.usesDeviceFlow else { return }
+        guard !trimmed.isEmpty else {
+            state.oauth?.errorMessage = OAuthError.invalidCallback.errorDescription
+            render()
+            return
+        }
+        let generation = oauthGeneration
+        let provider = flow.provider
+        let sessionState = flow.sessionState ?? ""
+        state.oauth?.errorMessage = nil
+        state.oauth?.phase = .finishing
+        render()
+
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                try await client.submitOAuthCallback(provider: provider.callbackProvider, redirectURL: trimmed, state: sessionState)
+                // Completion is detected by the running poll loop; nothing else to do here.
+            } catch {
+                guard self.isCurrentOAuth(generation), !(error is CancellationError) else { return }
+                // Keep the flow alive so the user can correct the link and resubmit.
+                self.state.oauth?.phase = .waitingBrowser
+                self.state.oauth?.errorMessage = self.friendlyMessage(error)
+                self.render()
+            }
+        }
+    }
+
+    private func pollOAuth(client: CLIProxyAPIClient, provider: OAuthProvider, sessionState: String, generation: Int) async throws {
+        guard !sessionState.isEmpty else {
+            succeedOAuth()
+            return
+        }
+        for _ in 0..<150 { // ~5 minutes at 2s cadence
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            guard isCurrentOAuth(generation) else { return }
+            let status = try await client.pollOAuthStatus(state: sessionState)
+            guard isCurrentOAuth(generation) else { return }
+            switch status {
+            case .ok:
+                succeedOAuth()
+                return
+            case let .error(message):
+                throw OAuthError.providerError(message)
+            case .wait:
+                continue
+            }
+        }
+        throw OAuthError.timeout
+    }
+
+    private func succeedOAuth() {
+        let name = state.oauth?.provider.displayName ?? ""
+        cleanupOAuthResources()
+        state.oauth = nil
+        onHoldOpen?(false)
+        state.screen = .dashboard
+        render()
+        NSApp.activate(ignoringOtherApps: true)
+        showToast("\(name) 登录成功")
+        onRefresh?()
+    }
+
+    private func failOAuth(_ error: Error) {
+        cleanupOAuthResources()
+        onHoldOpen?(false)
+        state.oauth?.phase = .failed
+        state.oauth?.errorMessage = friendlyMessage(error)
+        render()
+    }
+
+    private func cancelOAuth() {
+        oauthGeneration += 1
+        cleanupOAuthResources()
+        onHoldOpen?(false)
+        state.oauth = nil
+        render()
+    }
+
+    private func cleanupOAuthResources() {
+        oauthTask?.cancel()
+        oauthTask = nil
+    }
+
+    private func isCurrentOAuth(_ generation: Int) -> Bool {
+        generation == oauthGeneration && state.oauth != nil
+    }
+
+    private func openURL(_ string: String) {
+        guard let url = URL(string: string) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func friendlyMessage(_ error: Error) -> String {
+        if let oauthError = error as? OAuthError {
+            return oauthError.errorDescription ?? "出错了"
+        }
+        if let poolError = error as? PoolClientError {
+            return poolError.errorDescription ?? "出错了"
+        }
+        return error.localizedDescription
+    }
+
+    // MARK: - API keys
+
+    private func renderAPIKeys(in root: NSStackView) {
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        header.addArrangedSubview(circularIconButton(symbol: "chevron.left", tooltip: "Back") { [weak self] in
+            self?.showDashboard()
+        })
+        header.addArrangedSubview(label("API 密钥", font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor))
+        header.addArrangedSubview(NSView())
+        let refresh = circularIconButton(symbol: "arrow.clockwise", tooltip: "Refresh") { [weak self] in
+            self?.loadAPIKeys()
+        }
+        refresh.isEnabled = !state.apiKeysLoading
+        header.addArrangedSubview(refresh)
+        addFullWidth(header, to: root)
+
+        addFullWidth(label(
+            "管理当前服务的 API 密钥，可复制、新增或删除。",
+            font: .systemFont(ofSize: 11),
+            color: .secondaryLabelColor
+        ), to: root)
+
+        if let error = state.apiKeysError {
+            addFullWidth(messageView(text: error), to: root)
+        }
+
+        addFullWidth(apiKeyAddRow(), to: root)
+
+        if state.apiKeysLoading && state.apiKeys == nil {
+            addFullWidth(placeholderCard(symbol: "key.horizontal", title: "加载中", detail: "正在获取 API 密钥…"), to: root)
+        } else if let keys = state.apiKeys {
+            if keys.isEmpty {
+                addFullWidth(placeholderCard(symbol: "key.horizontal", title: "暂无密钥", detail: "在上方输入并新增第一个 API 密钥。"), to: root)
+            } else {
+                let scroll = NSScrollView()
+                scroll.hasVerticalScroller = true
+                scroll.borderType = .noBorder
+                scroll.drawsBackground = false
+                scroll.scrollerStyle = .overlay
+                scroll.automaticallyAdjustsContentInsets = false
+
+                let stack = TopAlignedStackView()
+                stack.orientation = .vertical
+                stack.alignment = .leading
+                stack.spacing = 6
+                stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 4, right: 0)
+                stack.translatesAutoresizingMaskIntoConstraints = false
+                scroll.documentView = stack
+                NSLayoutConstraint.activate([
+                    stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+                ])
+
+                for key in keys {
+                    let row = apiKeyRow(key)
+                    stack.addArrangedSubview(row)
+                    row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                }
+                scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+                addFullWidth(scroll, to: root)
+            }
+        }
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        root.addArrangedSubview(spacer)
+    }
+
+    private func apiKeyAddRow() -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.distribution = .fill
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let field = NSTextField(string: "")
+        field.placeholderString = "输入新的 API 密钥"
+        field.font = .systemFont(ofSize: 12)
+        field.bezelStyle = .roundedBezel
+        field.lineBreakMode = .byTruncatingHead
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        row.addArrangedSubview(field)
+
+        let addButton = CallbackButton(title: state.apiKeyAdding ? "添加中…" : "添加") { [weak self, weak field] in
+            guard let self, let field else { return }
+            self.submitNewAPIKey(field.stringValue)
+        }
+        addButton.bezelStyle = .rounded
+        addButton.isEnabled = !state.apiKeyAdding
+        addButton.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(addButton)
+        container.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+
+        // One-click: generate a strong random key, save it, and copy it to the clipboard.
+        let generate = CallbackButton(title: "🎲 生成随机密钥并复制") { [weak self] in
+            self?.generateAndAddAPIKey()
+        }
+        generate.bezelStyle = .rounded
+        generate.isEnabled = !state.apiKeyAdding
+        container.addArrangedSubview(generate)
+
+        return container
+    }
+
+    private func apiKeyRow(_ key: String) -> NSView {
+        let card = cardView()
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
+            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8)
+        ])
+
+        let keyLabel = label(maskKey(key), font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .labelColor)
+        keyLabel.lineBreakMode = .byTruncatingMiddle
+        keyLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(keyLabel)
+        row.addArrangedSubview(NSView())
+
+        if state.pendingDeleteKey == key {
+            row.addArrangedSubview(label("删除？", font: .systemFont(ofSize: 11, weight: .medium), color: .systemRed))
+            let confirm = CallbackButton(title: "删除") { [weak self] in
+                self?.deleteAPIKeyConfirmed(key)
+            }
+            confirm.bezelStyle = .rounded
+            confirm.contentTintColor = .systemRed
+            confirm.font = .systemFont(ofSize: 11, weight: .semibold)
+            row.addArrangedSubview(confirm)
+            row.addArrangedSubview(linkButton(title: "取消") { [weak self] in
+                self?.state.pendingDeleteKey = nil
+                self?.render()
+            })
+        } else {
+            row.addArrangedSubview(circularIconButton(symbol: "doc.on.doc", tooltip: "复制密钥") { [weak self] in
+                self?.copyToClipboard(key, notice: "已复制密钥")
+            })
+            let trash = circularIconButton(symbol: "trash", tooltip: "删除密钥") { [weak self] in
+                self?.state.pendingDeleteKey = key
+                self?.render()
+            }
+            trash.contentTintColor = .systemRed
+            row.addArrangedSubview(trash)
+        }
+        return card
+    }
+
+    private func maskKey(_ key: String) -> String {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 4 {
+            return trimmed
+        }
+        if trimmed.count <= 12 {
+            return String(trimmed.prefix(2)) + "••••" + String(trimmed.suffix(2))
+        }
+        return String(trimmed.prefix(6)) + "••••••" + String(trimmed.suffix(4))
+    }
+
+    private func loadAPIKeys() {
+        guard state.settings.isConfigured else {
+            state.apiKeysError = "请先配置服务地址与管理密钥。"
+            render()
+            return
+        }
+        state.apiKeysLoading = true
+        state.apiKeysError = nil
+        render()
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                let keys = try await client.fetchAPIKeys()
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeys = keys
+                self.state.apiKeysLoading = false
+                self.state.pendingDeleteKey = nil
+                self.render()
+            } catch {
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeysError = self.friendlyMessage(error)
+                self.state.apiKeysLoading = false
+                self.render()
+            }
+        }
+    }
+
+    private func submitNewAPIKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, state.settings.isConfigured, !state.apiKeyAdding else { return }
+        state.apiKeyAdding = true
+        state.apiKeysError = nil
+        render()
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                try await client.addAPIKey(trimmed)
+                let keys = try await client.fetchAPIKeys()
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeys = keys
+                self.state.apiKeyAdding = false
+                self.render()
+                self.showToast("已新增密钥")
+            } catch {
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeysError = self.friendlyMessage(error)
+                self.state.apiKeyAdding = false
+                self.render()
+            }
+        }
+    }
+
+    /// Generates a strong random key, saves it, and copies it to the clipboard in one step.
+    private func generateAndAddAPIKey() {
+        guard state.settings.isConfigured, !state.apiKeyAdding else { return }
+        let key = generateAPIKey()
+        state.apiKeyAdding = true
+        state.apiKeysError = nil
+        render()
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                try await client.addAPIKey(key)
+                let keys = try await client.fetchAPIKeys()
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeys = keys
+                self.state.apiKeyAdding = false
+                self.render()
+                self.copyToClipboard(key, notice: "已生成并复制密钥")
+            } catch {
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeysError = self.friendlyMessage(error)
+                self.state.apiKeyAdding = false
+                self.render()
+            }
+        }
+    }
+
+    private func deleteAPIKeyConfirmed(_ key: String) {
+        guard state.settings.isConfigured else { return }
+        state.pendingDeleteKey = nil
+        state.apiKeysError = nil
+        render()
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                try await client.deleteAPIKey(key)
+                let keys = try await client.fetchAPIKeys()
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeys = keys
+                self.render()
+                self.showToast("已删除密钥")
+            } catch {
+                guard self.state.screen == .apiKeys else { return }
+                self.state.apiKeysError = self.friendlyMessage(error)
+                self.render()
+            }
+        }
+    }
+
     // MARK: - Account detail
 
     private func openDetail(_ account: AccountQuota) {
@@ -1507,9 +2339,16 @@ final class PopoverViewController: NSViewController {
         titleStack.orientation = .vertical
         titleStack.alignment = .leading
         titleStack.spacing = 2
-        let name = label(account.auth.displayName, font: .systemFont(ofSize: 14, weight: .semibold), color: .labelColor)
-        name.lineBreakMode = .byTruncatingMiddle
-        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // Click the account name to copy the email (falls back to the account identifier).
+        let copyValue = firstNonEmpty(account.auth.email, account.auth.account, account.auth.displayName) ?? account.auth.displayName
+        let copiedEmail = firstNonEmpty(account.auth.email) != nil
+        let name = copyableLabelRow(
+            text: account.auth.displayName,
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor,
+            copyValue: copyValue,
+            notice: copiedEmail ? "已复制邮箱" : "已复制账号"
+        )
         titleStack.addArrangedSubview(name)
         let provider = ProviderCatalog.info(for: account.auth.normalizedProvider).displayName
         let subtitle = account.effectivePlanType.map { "\(provider) · \($0.capitalized)" } ?? provider
@@ -1646,18 +2485,19 @@ final class PopoverViewController: NSViewController {
         detailSectionCard(title: "账号信息", symbol: "info.circle.fill") { stack in
             let auth = account.auth
             let detail = account.detail
-            @MainActor func addRow(_ title: String, _ value: String?) {
+            @MainActor func addRow(_ title: String, _ value: String?, copyable: Bool = false) {
                 guard let value, !value.isEmpty else { return }
-                let row = detailRow(title: title, value: value)
+                let row = copyable ? detailRow(title: title, value: value, copyNotice: "已复制\(title)")
+                                   : detailRow(title: title, value: value)
                 stack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             }
             addRow("Provider", ProviderCatalog.info(for: auth.normalizedProvider).displayName)
-            addRow("邮箱", auth.email)
+            addRow("邮箱", auth.email, copyable: true)
             addRow("项目", auth.projectID)
             addRow("账号类型", detail?.accountType)
-            addRow("账号标识", auth.account)
-            addRow("ChatGPT Account ID", detail?.chatgptAccountID ?? auth.accountID)
+            addRow("账号标识", auth.account, copyable: true)
+            addRow("ChatGPT Account ID", detail?.chatgptAccountID ?? auth.accountID, copyable: true)
             addRow("Auth Index", auth.authIndex.isEmpty ? nil : auth.authIndex)
             addRow("计划", account.effectivePlanType?.capitalized)
             if let date = detail?.subscriptionActiveStart {
@@ -1718,19 +2558,86 @@ final class PopoverViewController: NSViewController {
         return card
     }
 
-    private func detailRow(title: String, value: String) -> NSView {
+    private func detailRow(title: String, value: String, copyNotice: String? = nil) -> NSView {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 2
-        stack.addArrangedSubview(label(title, font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor))
+
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 4
+        titleRow.addArrangedSubview(label(title, font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor))
+        if copyNotice != nil {
+            let config = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+            let copyIcon = NSImageView(image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制")?
+                .withSymbolConfiguration(config) ?? NSImage())
+            copyIcon.contentTintColor = .tertiaryLabelColor
+            titleRow.addArrangedSubview(copyIcon)
+        }
+        stack.addArrangedSubview(titleRow)
+
         let valueLabel = label(value, font: .systemFont(ofSize: 12, weight: .regular), color: .labelColor)
         valueLabel.lineBreakMode = .byWordWrapping
         valueLabel.maximumNumberOfLines = 3
-        valueLabel.isSelectable = true
+        // Copyable rows handle clicks themselves; leave non-copyable values text-selectable.
+        valueLabel.isSelectable = (copyNotice == nil)
         valueLabel.preferredMaxLayoutWidth = popoverWidth - 92
         stack.addArrangedSubview(valueLabel)
-        return stack
+
+        guard let copyNotice else {
+            return stack
+        }
+        let clickable = ClickableCardView(fill: .clear, border: .clear, radius: 6)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        clickable.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: clickable.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: clickable.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: clickable.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: clickable.bottomAnchor)
+        ])
+        clickable.toolTip = "点击复制"
+        clickable.onClick = { [weak self] in
+            self?.copyToClipboard(value, notice: copyNotice)
+        }
+        return clickable
+    }
+
+    /// A label paired with a copy glyph; clicking anywhere copies `copyValue`.
+    private func copyableLabelRow(text: String, font: NSFont, color: NSColor, copyValue: String, notice: String) -> NSView {
+        let clickable = ClickableCardView(fill: .clear, border: .clear, radius: 5)
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 5
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let textLabel = label(text, font: font, color: color)
+        textLabel.lineBreakMode = .byTruncatingMiddle
+        textLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(textLabel)
+
+        let config = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        let copyIcon = NSImageView(image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制")?
+            .withSymbolConfiguration(config) ?? NSImage())
+        copyIcon.contentTintColor = .tertiaryLabelColor
+        copyIcon.setContentCompressionResistancePriority(.required, for: .horizontal)
+        row.addArrangedSubview(copyIcon)
+
+        clickable.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: clickable.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: clickable.trailingAnchor),
+            row.topAnchor.constraint(equalTo: clickable.topAnchor, constant: 1),
+            row.bottomAnchor.constraint(equalTo: clickable.bottomAnchor, constant: -1)
+        ])
+        clickable.toolTip = "点击复制"
+        clickable.onClick = { [weak self] in
+            self?.copyToClipboard(copyValue, notice: notice)
+        }
+        return clickable
     }
 
     private func detailStatus(_ account: AccountQuota) -> (String, NSColor) {

@@ -38,6 +38,37 @@ The app can connect to multiple CLIProxyAPI services ("号池" / pools) and swit
 - The menu bar shows the quota of the currently selected service. Switching shows that service's last-loaded data instantly while a fresh refresh runs in the background.
 - Upgrading from a single-service build automatically migrates your existing connection into the first service.
 
+## Account & key management (账号与密钥管理)
+
+Beyond monitoring, the dashboard can manage the connected service directly, so routine account/key chores no longer require the CLIProxyAPI web console.
+
+### Copy an account email (复制邮箱)
+
+Open an account's detail screen, then click the account name at the top (or the **邮箱 / ChatGPT Account ID / 账号标识** rows) to copy that value to the clipboard. A brief "已复制" toast confirms the copy.
+
+### OAuth login from the menu bar (OAuth 登录)
+
+When an account drops its login, re-authorize it without opening the web UI. The flow is fully manual (copy a link / paste the callback), so you can log in with **any browser**, not just the system default:
+
+1. On the dashboard, click the **•••** button → **添加账号（OAuth 登录）**.
+2. Pick a provider (Codex, Claude, Antigravity, Grok, or Kimi).
+3. **复制授权链接**, open it in whichever browser you like, and log in.
+4. For Codex / Claude / Antigravity / Grok: after login the browser is redirected to a `http://localhost:<port>/…` address (the page will look like it failed to load — that's expected). **Copy that whole address from the address bar, paste it into the app, and click 提交.** Kimi uses a device flow — just authorize in the browser and the app detects completion automatically.
+
+How it works: the app requests the auth URL (`/v0/management/<provider>-auth-url`), you paste the callback back to `/v0/management/oauth-callback`, and it polls `/v0/management/get-auth-status` until done. The server performs the token exchange, so the app never handles account tokens. The popover stays open while you switch to the browser and back.
+
+> The loopback callback URL works even when CLIProxyAPI runs on a remote VPS — you're only relaying the URL the provider handed your browser, and the server completes the exchange.
+
+### API key management (API 密钥)
+
+Click **•••** → **API 密钥…** to view the current service's API keys (`/v0/management/api-keys`). You can:
+
+- **🎲 生成随机密钥并复制** — one click creates a strong random key, saves it, and copies it to the clipboard.
+- Add a specific key by typing it and clicking **添加**.
+- Copy any key, or delete one (with an inline confirmation).
+
+Keys are shown masked; copying always copies the full value.
+
 ## Build a macOS app bundle
 
 No Xcode is required for the default app bundle:
@@ -54,7 +85,7 @@ Scripts/build_app.sh
 open "dist/CPA.app"
 ```
 
-The app runs as a menu bar accessory and does not manage or modify the account pool.
+The app runs as a menu bar accessory. Alongside monitoring, it can re-authorize accounts via OAuth and manage API keys for the connected service (see **Account & key management** above).
 
 ## Package for GitHub Releases
 

@@ -1,4 +1,18 @@
 import Foundation
+import Security
+
+/// Generates a cryptographically random API key suitable for CLIProxyAPI's `api-keys` list.
+/// Format: `<prefix>` + URL-safe base64 of `byteCount` random bytes (e.g. `sk-cpa-…`).
+public func generateAPIKey(prefix: String = "sk-cpa-", byteCount: Int = 24) -> String {
+    var bytes = [UInt8](repeating: 0, count: max(16, byteCount))
+    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+    let data = status == errSecSuccess ? Data(bytes) : Data(UUID().uuidString.utf8)
+    let token = data.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    return prefix + token
+}
 
 public enum PoolClientError: LocalizedError, Sendable {
     case notConfigured
@@ -550,4 +564,122 @@ private struct APICallRequest: Encodable {
 private struct APICallEnvelope {
     let statusCode: Int
     let body: String
+}
+
+// MARK: - OAuth login & API key management
+//
+// These live in the same file as `CLIProxyAPIClient` so they can reuse its private request
+// helpers (`applyManagementHeaders`, `data(for:)`). The management server performs the actual
+// token exchange and persistence; the client only relays callbacks and polls for completion.
+public extension CLIProxyAPIClient {
+    /// Requests an authorization URL and opaque session state for the given provider.
+    /// Note: `is_webui` is intentionally omitted — the server would otherwise spin up its own
+    /// loopback forwarder; this app captures the redirect locally instead.
+    func requestOAuthURL(for provider: OAuthProvider) async throws -> OAuthAuthURL {
+        guard settings.isConfigured else { throw PoolClientError.notConfigured }
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: provider.authPath)
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw PoolClientError.invalidResponse("auth-url response was not JSON")
+        }
+        guard let authURL = firstString(object["url"]), !authURL.isEmpty else {
+            throw PoolClientError.invalidResponse(firstString(object["error"]) ?? "auth-url response missing url")
+        }
+        return OAuthAuthURL(url: authURL, state: firstString(object["state"]) ?? "")
+    }
+
+    /// Relays a captured authorization `code` + `state` to the management server.
+    func submitOAuthCallback(provider: String, code: String, state: String) async throws {
+        try await postOAuthCallback(body: ["provider": provider, "code": code, "state": state])
+    }
+
+    /// Relays a full redirect URL (manual paste fallback); the server extracts `code`/`state`.
+    func submitOAuthCallback(provider: String, redirectURL: String, state: String) async throws {
+        var body: [String: Any] = ["provider": provider, "redirect_url": redirectURL]
+        if !state.isEmpty { body["state"] = state }
+        try await postOAuthCallback(body: body)
+    }
+
+    private func postOAuthCallback(body: [String: Any]) async throws {
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/oauth-callback")
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "POST"
+        applyManagementHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        _ = try await data(for: request)
+    }
+
+    /// Polls `/v0/management/get-auth-status` for one tick.
+    func pollOAuthStatus(state: String) async throws -> OAuthStatus {
+        var components = URLComponents(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/get-auth-status"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "state", value: state)]
+        guard let url = components?.url else {
+            throw PoolClientError.invalidResponse("invalid get-auth-status URL")
+        }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        switch (firstString(object["status"]) ?? "").lowercased() {
+        case "ok":
+            return .ok
+        case "error":
+            return .error(firstString(object["error"]) ?? "授权失败")
+        default:
+            return .wait
+        }
+    }
+
+    /// Returns the configured API key list (`GET /v0/management/api-keys`).
+    func fetchAPIKeys() async throws -> [String] {
+        guard settings.isConfigured else { throw PoolClientError.notConfigured }
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/api-keys")
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let raw = firstArray(object?["api-keys"], object?["api_keys"], object?["apiKeys"]) ?? []
+        return raw.compactMap { firstString($0) }
+    }
+
+    /// Appends an API key. The server's PATCH appends `new` when `old` is not found, so sending
+    /// `old == new == key` adds the key (and is a no-op if it already exists).
+    func addAPIKey(_ key: String) async throws {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw PoolClientError.invalidResponse("API key cannot be empty")
+        }
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/api-keys")
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "PATCH"
+        applyManagementHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["old": trimmed, "new": trimmed])
+        _ = try await data(for: request)
+    }
+
+    /// Deletes an API key by exact value (`DELETE /v0/management/api-keys?value=…`).
+    func deleteAPIKey(_ key: String) async throws {
+        var components = URLComponents(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/api-keys"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "value", value: key)]
+        guard let url = components?.url else {
+            throw PoolClientError.invalidResponse("invalid api-keys URL")
+        }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "DELETE"
+        applyManagementHeaders(to: &request)
+        _ = try await data(for: request)
+    }
 }
