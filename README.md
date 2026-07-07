@@ -28,6 +28,10 @@ On first launch, click the menu bar icon and add your first service:
 
 The management password is stored in macOS Keychain. You can add more services and switch between them at any time (see **Multiple services**).
 
+## Config-based channels on the dashboard (配置渠道)
+
+Channels defined in the server's `config.yaml` — `openai-compatibility` providers (e.g. an "opencode" entry) and the `claude/codex/gemini/vertex-api-key` sections — are not OAuth accounts and never appear in the server's auth-files list, so earlier versions could not show them. The dashboard now lists each of them as its own provider section (tagged 配置渠道), with one row per configured API key (masked). Opening a row shows the channel's models (resolved from config), its base URL, and the config source; these credentials have no live quota, so no usage bars are shown.
+
 ## Multiple services
 
 The app can connect to multiple CLIProxyAPI services ("号池" / pools) and switch between them instantly. Services are fully independent and never share data.

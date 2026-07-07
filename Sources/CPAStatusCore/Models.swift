@@ -255,13 +255,24 @@ public struct AccountQuota: Identifiable, Equatable, Sendable {
     public let errorMessage: String?
     /// Rich per-account runtime data parsed from the auth-files list entry, shown in the detail view.
     public let detail: AccountDetail?
+    /// For config-based channels: the models resolved from config at snapshot time.
+    /// The detail screen shows these directly (the per-auth models endpoint only
+    /// serves file/OAuth credentials).
+    public let configModels: [CPAModelDefinition]?
 
-    public init(auth: AuthFile, usage: UsageSnapshot?, errorMessage: String?, detail: AccountDetail? = nil) {
+    public init(
+        auth: AuthFile,
+        usage: UsageSnapshot?,
+        errorMessage: String?,
+        detail: AccountDetail? = nil,
+        configModels: [CPAModelDefinition]? = nil
+    ) {
         self.id = auth.id
         self.auth = auth
         self.usage = usage
         self.errorMessage = errorMessage
         self.detail = detail
+        self.configModels = configModels
     }
 
     public var isDisabled: Bool {

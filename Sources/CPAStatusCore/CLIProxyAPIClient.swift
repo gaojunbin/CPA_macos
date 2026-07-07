@@ -52,6 +52,9 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     public func fetchPoolSnapshot() async throws -> PoolSnapshot {
+        // Config-based channels (openai-compatibility / api-key sections) never
+        // appear in auth-files; fetch them concurrently and add their own sections.
+        async let configChannels = fetchConfigChannelAccounts()
         let (allAuthFiles, details) = try await fetchAuthFilesAndDetails()
         let now = Date()
 
@@ -75,6 +78,23 @@ public struct CLIProxyAPIClient: Sendable {
             pools.append(ProviderPool(provider: providerInfo, accounts: accounts, fetchedAt: now))
         }
 
+        let groupedConfig = Dictionary(grouping: await configChannels.accounts) { account in
+            ProviderCatalog.info(for: account.auth.normalizedProvider).key
+        }
+        for (providerKey, channelAccounts) in groupedConfig {
+            let providerInfo = ProviderCatalog.info(for: providerKey)
+            let accounts = channelAccounts.map { account in
+                AccountQuota(
+                    auth: account.auth,
+                    usage: nil,
+                    errorMessage: nil,
+                    detail: AccountDetail(dict: Self.configDetailDict(for: account)),
+                    configModels: account.models
+                )
+            }
+            pools.append(ProviderPool(provider: providerInfo, accounts: accounts, fetchedAt: now))
+        }
+
         pools.sort { lhs, rhs in
             if lhs.provider.priority != rhs.provider.priority {
                 return lhs.provider.priority < rhs.provider.priority
@@ -83,6 +103,16 @@ public struct CLIProxyAPIClient: Sendable {
         }
 
         return PoolSnapshot(providers: pools, fetchedAt: now)
+    }
+
+    /// Minimal detail payload for a config-channel credential so the detail
+    /// screen's 账号信息 card has something truthful to show.
+    private static func configDetailDict(for account: ConfigChannelAccount) -> [String: Any] {
+        var dict: [String: Any] = ["source": "config"]
+        if let baseURL = account.baseURL, !baseURL.isEmpty {
+            dict["note"] = baseURL
+        }
+        return dict
     }
 
     public func fetchAuthFiles() async throws -> [AuthFile] {
@@ -142,7 +172,7 @@ public struct CLIProxyAPIClient: Sendable {
     /// (openai-compatibility and the api-key sections) never appear in the auth-files
     /// list, so they are read from their own config endpoints and merged in.
     public func fetchModelPool() async throws -> ModelPoolSnapshot {
-        async let configResults = fetchConfigChannelResults()
+        async let configChannels = fetchConfigChannelAccounts()
         let authFiles = try await fetchAuthFiles().filter { !$0.disabled }
 
         var results: [AuthModelsResult] = []
@@ -170,48 +200,58 @@ public struct CLIProxyAPIClient: Sendable {
             start += batchSize
         }
 
-        return ModelPoolAggregator.aggregate(results + (await configResults))
+        let config = await configChannels
+        results.append(contentsOf: config.accounts.map { AuthModelsResult(auth: $0.auth, models: $0.models) })
+        results.append(contentsOf: config.failedSections.map { ConfigChannelSynthesizer.failureResult(providerKey: $0) })
+        return ModelPoolAggregator.aggregate(results)
     }
 
     /// Reads the config-based channels (openai-compatibility plus the claude / codex /
-    /// gemini / vertex api-key sections) and synthesizes per-credential model results.
-    /// Sections that fail to load are reported as one failed entry each; a 404 (endpoint
-    /// absent on older servers) counts as "no such channels".
-    public func fetchConfigChannelResults() async -> [AuthModelsResult] {
-        await withTaskGroup(of: [AuthModelsResult].self, returning: [AuthModelsResult].self) { group in
-            group.addTask { await self.compatChannelResults() }
+    /// gemini / vertex api-key sections) and synthesizes one account per credential.
+    /// Failed sections are reported by name; a 404 (endpoint absent on older servers)
+    /// counts as "no such channels".
+    public func fetchConfigChannelAccounts() async -> ConfigChannelFetch {
+        await withTaskGroup(
+            of: (accounts: [ConfigChannelAccount], failedSection: String?).self,
+            returning: ConfigChannelFetch.self
+        ) { group in
+            group.addTask { await self.compatChannelAccounts() }
             for kind in APIKeyChannelKind.allCases {
-                group.addTask { await self.apiKeyChannelResults(kind: kind) }
+                group.addTask { await self.apiKeyChannelAccounts(kind: kind) }
             }
-            var results: [AuthModelsResult] = []
+            var accounts: [ConfigChannelAccount] = []
+            var failedSections: [String] = []
             for await value in group {
-                results.append(contentsOf: value)
+                accounts.append(contentsOf: value.accounts)
+                if let failed = value.failedSection {
+                    failedSections.append(failed)
+                }
             }
-            return results
+            return ConfigChannelFetch(accounts: accounts, failedSections: failedSections.sorted())
         }
     }
 
-    private func compatChannelResults() async -> [AuthModelsResult] {
+    private func compatChannelAccounts() async -> (accounts: [ConfigChannelAccount], failedSection: String?) {
         do {
             let root = try await fetchManagementJSON(path: "/v0/management/openai-compatibility")
-            return ConfigChannelSynthesizer.compatResults(root: root)
+            return (ConfigChannelSynthesizer.compatAccounts(root: root), nil)
         } catch {
-            return Self.isNotFound(error) ? [] : [ConfigChannelSynthesizer.failureResult(providerKey: "openai-compatibility")]
+            return ([], Self.isNotFound(error) ? nil : "openai-compatibility")
         }
     }
 
-    private func apiKeyChannelResults(kind: APIKeyChannelKind) async -> [AuthModelsResult] {
+    private func apiKeyChannelAccounts(kind: APIKeyChannelKind) async -> (accounts: [ConfigChannelAccount], failedSection: String?) {
         do {
             let root = try await fetchManagementJSON(path: kind.managementPath)
             let entries = ConfigChannelSynthesizer.apiKeyEntries(kind: kind, root: root)
-            guard !entries.isEmpty else { return [] }
+            guard !entries.isEmpty else { return ([], nil) }
             var staticModels: [CPAModelDefinition] = []
             if entries.contains(where: { $0.overrideModelIDs.isEmpty }) {
                 staticModels = (try? await fetchStaticModelDefinitions(channel: kind.definitionsChannel)) ?? []
             }
-            return ConfigChannelSynthesizer.apiKeyResults(kind: kind, entries: entries, staticModels: staticModels)
+            return (ConfigChannelSynthesizer.apiKeyAccounts(kind: kind, entries: entries, staticModels: staticModels), nil)
         } catch {
-            return Self.isNotFound(error) ? [] : [ConfigChannelSynthesizer.failureResult(providerKey: kind.rawValue)]
+            return ([], Self.isNotFound(error) ? nil : kind.rawValue)
         }
     }
 

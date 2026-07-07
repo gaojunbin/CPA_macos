@@ -32,12 +32,71 @@ public struct APIKeyChannelEntry: Equatable, Sendable {
     public let excludedPatterns: [String]
     /// Optional model prefix; when set the server also registers `prefix/<id>`.
     public let prefix: String?
+    /// Masked form of the entry's api-key (never the full secret).
+    public let maskedKey: String?
+    /// Optional per-entry base-url override.
+    public let baseURL: String?
 
-    public init(overrideModelIDs: [String], excludedPatterns: [String], prefix: String?) {
+    public init(
+        overrideModelIDs: [String],
+        excludedPatterns: [String],
+        prefix: String?,
+        maskedKey: String? = nil,
+        baseURL: String? = nil
+    ) {
         self.overrideModelIDs = overrideModelIDs
         self.excludedPatterns = excludedPatterns
         self.prefix = prefix
+        self.maskedKey = maskedKey
+        self.baseURL = baseURL
     }
+}
+
+/// One credential of a config-based channel, shaped for both the dashboard
+/// (synthesized `AuthFile` + channel metadata) and the model pool (`models`).
+public struct ConfigChannelAccount: Equatable, Sendable {
+    public let auth: AuthFile
+    public let models: [CPAModelDefinition]
+    public let baseURL: String?
+
+    public init(auth: AuthFile, models: [CPAModelDefinition], baseURL: String?) {
+        self.auth = auth
+        self.models = models
+        self.baseURL = baseURL
+    }
+}
+
+/// Result of reading every config-channel section: the synthesized credentials
+/// plus the names of sections whose fetch failed (results may be incomplete).
+public struct ConfigChannelFetch: Equatable, Sendable {
+    public let accounts: [ConfigChannelAccount]
+    public let failedSections: [String]
+
+    public init(accounts: [ConfigChannelAccount], failedSections: [String]) {
+        self.accounts = accounts
+        self.failedSections = failedSections
+    }
+}
+
+/// True for provider keys that represent config.yaml channels (key credentials)
+/// rather than file/OAuth accounts.
+public func isConfigChannelKey(_ providerKey: String) -> Bool {
+    let normalized = providerKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return normalized.hasSuffix("-api-key") ||
+        normalized.hasPrefix("openai-compatible-") ||
+        normalized == "openai-compatibility"
+}
+
+/// Masks a secret for display: keeps a short prefix/suffix, hides the middle.
+public func maskedSecret(_ value: String) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.count <= 4 {
+        return trimmed
+    }
+    if trimmed.count <= 12 {
+        return String(trimmed.prefix(2)) + "••••" + String(trimmed.suffix(2))
+    }
+    return String(trimmed.prefix(6)) + "••••••" + String(trimmed.suffix(4))
 }
 
 /// Converts management config-section payloads into the same per-credential
@@ -46,11 +105,11 @@ public struct APIKeyChannelEntry: Equatable, Sendable {
 public enum ConfigChannelSynthesizer {
     // MARK: openai-compatibility
 
-    /// Parses `GET /v0/management/openai-compatibility` and returns one result per
+    /// Parses `GET /v0/management/openai-compatibility` and returns one account per
     /// api-key entry (or one for keyless channels). Disabled channels are skipped.
-    public static func compatResults(root: [String: Any]) -> [AuthModelsResult] {
+    public static func compatAccounts(root: [String: Any]) -> [ConfigChannelAccount] {
         let entries = firstArray(root["openai-compatibility"], root["openai_compatibility"]) ?? []
-        var results: [AuthModelsResult] = []
+        var accounts: [ConfigChannelAccount] = []
         for (index, raw) in entries.enumerated() {
             guard let dict = raw as? [String: Any] else { continue }
             if boolValue(dict["disabled"]) == true { continue }
@@ -58,24 +117,38 @@ public enum ConfigChannelSynthesizer {
             let name = firstString(dict["name"]) ?? "openai-compatibility"
             let providerKey = compatProviderKey(name: name)
             let prefix = firstString(dict["prefix"])
+            let baseURL = firstString(dict["base-url"], dict["baseURL"], dict["baseUrl"])
             let modelIDs = mappingModelIDs(firstArray(dict["models"]))
             let models = modelIDs
                 .flatMap { withPrefixVariants($0, prefix: prefix) }
                 .map { CPAModelDefinition(id: $0, displayName: nil, type: "openai-compatibility", ownedBy: name) }
 
-            let keyCount = max(1, (firstArray(dict["api-key-entries"], dict["apiKeyEntries"]) ?? []).count)
-            for keyIndex in 0..<keyCount {
+            let keyEntries = firstArray(dict["api-key-entries"], dict["apiKeyEntries"]) ?? []
+            let maskedKeys: [String?] = keyEntries.isEmpty
+                ? [nil]
+                : keyEntries.map { entry in
+                    guard let entryDict = entry as? [String: Any],
+                          let key = firstString(entryDict["api-key"], entryDict["apiKey"])
+                    else { return nil }
+                    return maskedSecret(key)
+                }
+            for (keyIndex, maskedKey) in maskedKeys.enumerated() {
                 let auth = AuthFile(
                     id: "\(providerKey)#\(index)-\(keyIndex)",
                     name: name,
                     provider: providerKey,
                     type: providerKey,
-                    label: name
+                    label: maskedKey ?? name
                 )
-                results.append(AuthModelsResult(auth: auth, models: models))
+                accounts.append(ConfigChannelAccount(auth: auth, models: models, baseURL: baseURL))
             }
         }
-        return results
+        return accounts
+    }
+
+    /// Model-pool shaped view of `compatAccounts`.
+    public static func compatResults(root: [String: Any]) -> [AuthModelsResult] {
+        compatAccounts(root: root).map { AuthModelsResult(auth: $0.auth, models: $0.models) }
     }
 
     /// Mirrors the server's internal provider key for a compat channel
@@ -100,20 +173,22 @@ public enum ConfigChannelSynthesizer {
             return APIKeyChannelEntry(
                 overrideModelIDs: mappingModelIDs(firstArray(dict["models"])),
                 excludedPatterns: excluded,
-                prefix: firstString(dict["prefix"])
+                prefix: firstString(dict["prefix"]),
+                maskedKey: firstString(dict["api-key"], dict["apiKey"]).map(maskedSecret),
+                baseURL: firstString(dict["base-url"], dict["baseURL"], dict["baseUrl"])
             )
         }
     }
 
-    /// Turns parsed entries into per-credential results. Entries without model
+    /// Turns parsed entries into per-credential accounts. Entries without model
     /// overrides serve `staticModels` (the channel defaults) minus their
     /// excluded patterns — the same resolution the server applies when
     /// registering config api-key credentials.
-    public static func apiKeyResults(
+    public static func apiKeyAccounts(
         kind: APIKeyChannelKind,
         entries: [APIKeyChannelEntry],
         staticModels: [CPAModelDefinition]
-    ) -> [AuthModelsResult] {
+    ) -> [ConfigChannelAccount] {
         entries.enumerated().map { index, entry in
             let base: [CPAModelDefinition]
             if entry.overrideModelIDs.isEmpty {
@@ -133,10 +208,20 @@ public enum ConfigChannelSynthesizer {
                 name: kind.rawValue,
                 provider: kind.rawValue,
                 type: kind.rawValue,
-                label: kind.rawValue
+                label: entry.maskedKey ?? kind.rawValue
             )
-            return AuthModelsResult(auth: auth, models: models)
+            return ConfigChannelAccount(auth: auth, models: models, baseURL: entry.baseURL)
         }
+    }
+
+    /// Model-pool shaped view of `apiKeyAccounts`.
+    public static func apiKeyResults(
+        kind: APIKeyChannelKind,
+        entries: [APIKeyChannelEntry],
+        staticModels: [CPAModelDefinition]
+    ) -> [AuthModelsResult] {
+        apiKeyAccounts(kind: kind, entries: entries, staticModels: staticModels)
+            .map { AuthModelsResult(auth: $0.auth, models: $0.models) }
     }
 
     /// A models==nil result so a failed section fetch surfaces in `failedAccounts`.

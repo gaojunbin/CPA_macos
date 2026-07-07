@@ -101,6 +101,57 @@ final class ConfigChannelTests: XCTestCase {
         XCTAssertFalse(ConfigChannelSynthesizer.matchesExcluded("model", patterns: []))
     }
 
+    // MARK: dashboard accounts
+
+    func testCompatAccountsCarryMaskedKeysAndBaseURL() throws {
+        let root = try json("""
+        {"openai-compatibility": [
+          {"name": "opencode",
+           "base-url": "https://api.opencode.example/v1",
+           "api-key-entries": [{"api-key": "sk-opencode-1234567890"}, {"api-key": "sk-2"}],
+           "models": [{"name": "m", "alias": "a"}]}
+        ]}
+        """)
+
+        let accounts = ConfigChannelSynthesizer.compatAccounts(root: root)
+        XCTAssertEqual(accounts.count, 2)
+        XCTAssertEqual(accounts[0].baseURL, "https://api.opencode.example/v1")
+        // Labels are masked keys, never the full secret.
+        XCTAssertEqual(accounts[0].auth.displayName, "sk-ope••••••7890")
+        XCTAssertFalse(accounts[0].auth.displayName.contains("sk-opencode-1234567890"))
+        XCTAssertEqual(accounts[1].auth.displayName, "sk-2")
+        XCTAssertEqual(accounts[0].models.map(\.id), ["a"])
+    }
+
+    func testKeylessCompatAccountFallsBackToChannelName() throws {
+        let root = try json("""
+        {"openai-compatibility": [{"name": "keyless", "models": [{"name": "m1"}]}]}
+        """)
+        let accounts = ConfigChannelSynthesizer.compatAccounts(root: root)
+        XCTAssertEqual(accounts.count, 1)
+        XCTAssertEqual(accounts.first?.auth.displayName, "keyless")
+    }
+
+    func testAPIKeyAccountsUseMaskedKeyLabels() throws {
+        let root = try json("""
+        {"claude-api-key": [{"api-key": "sk-ant-abcdefghijklmn", "models": [{"name": "n", "alias": "c1"}]}]}
+        """)
+        let entries = ConfigChannelSynthesizer.apiKeyEntries(kind: .claude, root: root)
+        let accounts = ConfigChannelSynthesizer.apiKeyAccounts(kind: .claude, entries: entries, staticModels: [])
+        XCTAssertEqual(accounts.count, 1)
+        XCTAssertEqual(accounts.first?.auth.displayName, "sk-ant••••••klmn")
+        XCTAssertEqual(accounts.first?.auth.provider, "claude-api-key")
+        XCTAssertEqual(accounts.first?.models.map(\.id), ["c1"])
+    }
+
+    func testIsConfigChannelKey() {
+        XCTAssertTrue(isConfigChannelKey("openai-compatible-opencode"))
+        XCTAssertTrue(isConfigChannelKey("claude-api-key"))
+        XCTAssertTrue(isConfigChannelKey("openai-compatibility"))
+        XCTAssertFalse(isConfigChannelKey("codex"))
+        XCTAssertFalse(isConfigChannelKey("claude"))
+    }
+
     // MARK: provider catalog
 
     func testProviderCatalogShowsCompatChannelName() {

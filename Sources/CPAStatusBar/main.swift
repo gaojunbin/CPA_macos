@@ -1306,7 +1306,10 @@ final class PopoverViewController: NSViewController {
         let title = label(pool.provider.displayName, font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor)
         row.addArrangedSubview(title)
 
-        if !pool.provider.supportsUsage {
+        if isConfigChannelKey(pool.provider.key) {
+            let hint = label("配置渠道", font: .systemFont(ofSize: 10, weight: .regular), color: .tertiaryLabelColor)
+            row.addArrangedSubview(hint)
+        } else if !pool.provider.supportsUsage {
             let hint = label("identity only", font: .systemFont(ofSize: 10, weight: .regular), color: .tertiaryLabelColor)
             row.addArrangedSubview(hint)
         }
@@ -2416,7 +2419,7 @@ final class PopoverViewController: NSViewController {
         ])
         header.addArrangedSubview(badge)
         header.addArrangedSubview(label(group.provider.displayName, font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor))
-        if isConfigChannel(group.provider.key) {
+        if isConfigChannelKey(group.provider.key) {
             let unit = group.accountCount > 1 ? "\(group.accountCount) 个密钥 · " : ""
             header.addArrangedSubview(label("\(unit)配置渠道", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
         } else if group.accountCount > 1 {
@@ -2433,13 +2436,6 @@ final class PopoverViewController: NSViewController {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         return card
-    }
-
-    /// Config-based channels (openai-compatibility / api-key sections) hold keys, not accounts.
-    private func isConfigChannel(_ providerKey: String) -> Bool {
-        providerKey.hasSuffix("-api-key") ||
-            providerKey.hasPrefix("openai-compatible-") ||
-            providerKey == "openai-compatibility"
     }
 
     private func modelPoolRow(_ entry: PoolModelEntry, group: ProviderModelGroup) -> NSView {
@@ -2499,6 +2495,13 @@ final class PopoverViewController: NSViewController {
         state.detailModelsLoading = false
         state.detailRefreshing = false
         state.screen = .detail
+        // Config-channel credentials carry their models in the snapshot; the
+        // per-auth models endpoint only knows file/OAuth credentials.
+        if let configModels = account.configModels {
+            state.detailModels = configModels
+            render()
+            return
+        }
         render()
         loadDetailModels(for: account)
     }
@@ -2535,6 +2538,11 @@ final class PopoverViewController: NSViewController {
 
     private func refreshDetail() {
         guard let account = state.detailAccount, state.settings.isConfigured else { return }
+        // Config-channel credentials have no live usage and their models come from
+        // the snapshot; there is nothing fresher to fetch per credential.
+        if account.configModels != nil {
+            return
+        }
         state.detailRefreshing = true
         state.detailModelsLoading = true
         render()
@@ -2627,7 +2635,8 @@ final class PopoverViewController: NSViewController {
         let refresh = circularIconButton(symbol: "arrow.clockwise", tooltip: "Refresh") { [weak self] in
             self?.refreshDetail()
         }
-        refresh.isEnabled = !state.detailRefreshing
+        // Config-channel credentials have nothing fresher to fetch per credential.
+        refresh.isEnabled = !state.detailRefreshing && account.configModels == nil
         row.addArrangedSubview(refresh)
         return row
     }
@@ -2683,9 +2692,15 @@ final class PopoverViewController: NSViewController {
         counters.distribution = .fillEqually
         counters.alignment = .centerY
         counters.spacing = 0
-        counters.addArrangedSubview(statView(value: "\(account.detail?.success ?? 0)", label: "成功", color: .systemGreen))
-        counters.addArrangedSubview(statView(value: "\(account.detail?.failed ?? 0)", label: "失败", color: .systemRed))
-        counters.addArrangedSubview(statView(value: displayPercent(account.lowestRemainingPercent), label: "最低剩余", color: summaryColor(account.lowestRemainingPercent)))
+        if let configModels = account.configModels {
+            // Config credentials have no request stats; show what we do know.
+            counters.addArrangedSubview(statView(value: "\(configModels.count)", label: "模型", color: .labelColor))
+            counters.addArrangedSubview(statView(value: "配置", label: "来源", color: .secondaryLabelColor))
+        } else {
+            counters.addArrangedSubview(statView(value: "\(account.detail?.success ?? 0)", label: "成功", color: .systemGreen))
+            counters.addArrangedSubview(statView(value: "\(account.detail?.failed ?? 0)", label: "失败", color: .systemRed))
+            counters.addArrangedSubview(statView(value: displayPercent(account.lowestRemainingPercent), label: "最低剩余", color: summaryColor(account.lowestRemainingPercent)))
+        }
         stack.addArrangedSubview(counters)
         counters.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         return card
@@ -2704,7 +2719,15 @@ final class PopoverViewController: NSViewController {
                     row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
                 }
             } else {
-                let note = noteLabel(text: account.auth.disabled ? "已暂停" : "该来源仅显示身份状态")
+                let text: String
+                if account.auth.disabled {
+                    text = "已暂停"
+                } else if account.configModels != nil {
+                    text = "配置渠道（config.yaml），无实时额度信息"
+                } else {
+                    text = "该来源仅显示身份状态"
+                }
+                let note = noteLabel(text: text)
                 stack.addArrangedSubview(note)
                 note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             }
@@ -2824,7 +2847,9 @@ final class PopoverViewController: NSViewController {
             if let date = detail?.subscriptionActiveUntil {
                 addRow("订阅到期", absoluteTime(date))
             }
-            if detail?.runtimeOnly == true {
+            if account.configModels != nil {
+                addRow("来源", "配置文件（config.yaml）")
+            } else if detail?.runtimeOnly == true {
                 addRow("来源", "运行时")
             } else {
                 addRow("来源", detail?.source)
@@ -2835,7 +2860,8 @@ final class PopoverViewController: NSViewController {
             if let priority = detail?.priority {
                 addRow("优先级", "\(priority)")
             }
-            addRow("备注", detail?.note)
+            // For config channels the synthesized note carries the channel's base-url.
+            addRow(account.configModels != nil ? "Base URL" : "备注", detail?.note)
             if let date = detail?.updatedAt {
                 addRow("更新时间", absoluteTime(date))
             }
