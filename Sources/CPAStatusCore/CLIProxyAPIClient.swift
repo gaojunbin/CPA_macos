@@ -138,8 +138,11 @@ public struct CLIProxyAPIClient: Sendable {
     /// Aggregates the models every enabled account can serve into a per-provider snapshot —
     /// the menu bar equivalent of the proxy's `/v1/models`, but reachable with just the
     /// management key. Disabled accounts are skipped because the server drops them from
-    /// rotation (their registry model list is empty anyway).
+    /// rotation (their registry model list is empty anyway). Config-based channels
+    /// (openai-compatibility and the api-key sections) never appear in the auth-files
+    /// list, so they are read from their own config endpoints and merged in.
     public func fetchModelPool() async throws -> ModelPoolSnapshot {
+        async let configResults = fetchConfigChannelResults()
         let authFiles = try await fetchAuthFiles().filter { !$0.disabled }
 
         var results: [AuthModelsResult] = []
@@ -167,7 +170,79 @@ public struct CLIProxyAPIClient: Sendable {
             start += batchSize
         }
 
-        return ModelPoolAggregator.aggregate(results)
+        return ModelPoolAggregator.aggregate(results + (await configResults))
+    }
+
+    /// Reads the config-based channels (openai-compatibility plus the claude / codex /
+    /// gemini / vertex api-key sections) and synthesizes per-credential model results.
+    /// Sections that fail to load are reported as one failed entry each; a 404 (endpoint
+    /// absent on older servers) counts as "no such channels".
+    public func fetchConfigChannelResults() async -> [AuthModelsResult] {
+        await withTaskGroup(of: [AuthModelsResult].self, returning: [AuthModelsResult].self) { group in
+            group.addTask { await self.compatChannelResults() }
+            for kind in APIKeyChannelKind.allCases {
+                group.addTask { await self.apiKeyChannelResults(kind: kind) }
+            }
+            var results: [AuthModelsResult] = []
+            for await value in group {
+                results.append(contentsOf: value)
+            }
+            return results
+        }
+    }
+
+    private func compatChannelResults() async -> [AuthModelsResult] {
+        do {
+            let root = try await fetchManagementJSON(path: "/v0/management/openai-compatibility")
+            return ConfigChannelSynthesizer.compatResults(root: root)
+        } catch {
+            return Self.isNotFound(error) ? [] : [ConfigChannelSynthesizer.failureResult(providerKey: "openai-compatibility")]
+        }
+    }
+
+    private func apiKeyChannelResults(kind: APIKeyChannelKind) async -> [AuthModelsResult] {
+        do {
+            let root = try await fetchManagementJSON(path: kind.managementPath)
+            let entries = ConfigChannelSynthesizer.apiKeyEntries(kind: kind, root: root)
+            guard !entries.isEmpty else { return [] }
+            var staticModels: [CPAModelDefinition] = []
+            if entries.contains(where: { $0.overrideModelIDs.isEmpty }) {
+                staticModels = (try? await fetchStaticModelDefinitions(channel: kind.definitionsChannel)) ?? []
+            }
+            return ConfigChannelSynthesizer.apiKeyResults(kind: kind, entries: entries, staticModels: staticModels)
+        } catch {
+            return Self.isNotFound(error) ? [] : [ConfigChannelSynthesizer.failureResult(providerKey: kind.rawValue)]
+        }
+    }
+
+    /// Static default models for a channel (`GET /v0/management/model-definitions/:channel`),
+    /// used for api-key entries that don't override `models`.
+    public func fetchStaticModelDefinitions(channel: String) async throws -> [CPAModelDefinition] {
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/model-definitions/\(channel)")
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        return try JSONDecoder().decode(ModelsResponse.self, from: data).models
+    }
+
+    private func fetchManagementJSON(path: String) async throws -> [String: Any] {
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: path)
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        applyManagementHeaders(to: &request)
+        let data = try await data(for: request)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw PoolClientError.invalidResponse("\(path) did not return a JSON object")
+        }
+        return object
+    }
+
+    private static func isNotFound(_ error: Error) -> Bool {
+        if case let PoolClientError.httpStatus(status, _) = error {
+            return status == 404
+        }
+        return false
     }
 
     /// Re-fetches live quota for a single account (used by the detail screen's refresh button).

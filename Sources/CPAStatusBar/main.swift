@@ -2416,7 +2416,10 @@ final class PopoverViewController: NSViewController {
         ])
         header.addArrangedSubview(badge)
         header.addArrangedSubview(label(group.provider.displayName, font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor))
-        if group.accountCount > 1 {
+        if isConfigChannel(group.provider.key) {
+            let unit = group.accountCount > 1 ? "\(group.accountCount) 个密钥 · " : ""
+            header.addArrangedSubview(label("\(unit)配置渠道", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
+        } else if group.accountCount > 1 {
             header.addArrangedSubview(label("\(group.accountCount) 个账号", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
         }
         header.addArrangedSubview(NSView())
@@ -2430,6 +2433,13 @@ final class PopoverViewController: NSViewController {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         return card
+    }
+
+    /// Config-based channels (openai-compatibility / api-key sections) hold keys, not accounts.
+    private func isConfigChannel(_ providerKey: String) -> Bool {
+        providerKey.hasSuffix("-api-key") ||
+            providerKey.hasPrefix("openai-compatible-") ||
+            providerKey == "openai-compatibility"
     }
 
     private func modelPoolRow(_ entry: PoolModelEntry, group: ProviderModelGroup) -> NSView {

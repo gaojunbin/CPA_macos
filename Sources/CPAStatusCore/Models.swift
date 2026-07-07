@@ -70,6 +70,42 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         normalizedProvider == "xai" || normalizedProvider == "x-ai" || normalizedProvider == "grok"
     }
 
+    /// Memberwise init for entries synthesized locally (e.g. config-based channels)
+    /// rather than decoded from the management auth-files list.
+    public init(
+        id: String,
+        authIndex: String = "",
+        name: String,
+        provider: String,
+        type: String = "",
+        label: String? = nil,
+        email: String? = nil,
+        account: String? = nil,
+        accountID: String? = nil,
+        planType: String? = nil,
+        projectID: String? = nil,
+        status: String? = nil,
+        statusMessage: String? = nil,
+        disabled: Bool = false,
+        unavailable: Bool = false
+    ) {
+        self.id = id
+        self.authIndex = authIndex
+        self.name = name
+        self.provider = provider
+        self.type = type
+        self.label = label
+        self.email = email
+        self.account = account
+        self.accountID = accountID
+        self.planType = planType
+        self.projectID = projectID
+        self.status = status
+        self.statusMessage = statusMessage
+        self.disabled = disabled
+        self.unavailable = unavailable
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id
         case authIndex = "auth_index"
@@ -712,13 +748,33 @@ public enum ProviderCatalog {
         "vertex": ProviderInfo(key: "vertex", displayName: "Vertex AI", symbolName: "cloud.fill", accentName: "indigo", priority: 5, supportsUsage: false),
         "antigravity": ProviderInfo(key: "antigravity", displayName: "Antigravity", symbolName: "paperplane.fill", accentName: "purple", priority: 6, supportsUsage: true),
         "xai": ProviderInfo(key: "xai", displayName: "Grok", symbolName: "x.circle.fill", accentName: "gray", priority: 7, supportsUsage: true),
-        "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: true)
+        "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: true),
+        // Config-based API-key channels (config.yaml sections, not OAuth accounts).
+        "codex-api-key": ProviderInfo(key: "codex-api-key", displayName: "Codex API Key", symbolName: "key.fill", accentName: "teal", priority: 40, supportsUsage: false),
+        "claude-api-key": ProviderInfo(key: "claude-api-key", displayName: "Claude API Key", symbolName: "key.fill", accentName: "orange", priority: 41, supportsUsage: false),
+        "gemini-api-key": ProviderInfo(key: "gemini-api-key", displayName: "Gemini API Key", symbolName: "key.fill", accentName: "blue", priority: 42, supportsUsage: false),
+        "vertex-api-key": ProviderInfo(key: "vertex-api-key", displayName: "Vertex API Key", symbolName: "key.fill", accentName: "indigo", priority: 43, supportsUsage: false)
     ]
+
+    private static let openAICompatiblePrefix = "openai-compatible-"
 
     public static func info(for rawKey: String) -> ProviderInfo {
         let normalized = normalizeProviderKey(rawKey)
         if let exact = table[normalized] {
             return exact
+        }
+        // "openai-compatible-<name>" is the server's internal key for an
+        // openai-compatibility channel; surface the channel's own name.
+        if normalized.hasPrefix(openAICompatiblePrefix) {
+            let channel = String(normalized.dropFirst(openAICompatiblePrefix.count))
+            return ProviderInfo(
+                key: normalized,
+                displayName: channel.isEmpty ? "OpenAI Compat" : channel,
+                symbolName: "circle.hexagongrid.fill",
+                accentName: "mint",
+                priority: 50,
+                supportsUsage: false
+            )
         }
         if normalized.contains("openai") {
             return ProviderInfo(key: normalized, displayName: "OpenAI Compat", symbolName: "circle.hexagongrid.fill", accentName: "mint", priority: 50, supportsUsage: false)
