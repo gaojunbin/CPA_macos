@@ -69,6 +69,18 @@ Click **•••** → **API 密钥…** to view the current service's API keys
 
 Keys are shown masked; copying always copies the full value.
 
+### Supported model list (模型列表)
+
+Click **•••** → **模型列表…** to see every model the current service can actually serve right now — the menu bar equivalent of the proxy's `/v1/models`, but fetched with just the management key (no inference API key needed).
+
+- Models are grouped by provider (Codex, Claude, Gemini, …) and deduplicated across that provider's accounts.
+- The header shows the distinct model count and how many accounts were aggregated.
+- Type in the search field to filter by model ID, display name, owner, or provider name.
+- Click any model row to copy its model ID — handy when configuring clients that talk to the proxy.
+- A `2/3`-style pill flags models only some of a provider's accounts can serve; a note appears if any account's model query failed.
+
+How it works: the app lists auth files (`/v0/management/auth-files`), skips disabled ones, queries `/v0/management/auth-files/models?name=…` for each in parallel batches, and merges the results per provider.
+
 ## Build a macOS app bundle
 
 No Xcode is required for the default app bundle:

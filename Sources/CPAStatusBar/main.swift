@@ -410,6 +410,7 @@ enum PopoverScreen {
     case detail
     case addAccount
     case apiKeys
+    case models
 }
 
 /// Tracks an in-flight OAuth login started from the menu bar.
@@ -459,6 +460,11 @@ struct PopoverState {
     var apiKeysError: String?
     var apiKeyAdding = false
     var pendingDeleteKey: String?
+    // Service-wide model pool
+    var modelPool: ModelPoolSnapshot?
+    var modelPoolLoading = false
+    var modelPoolError: String?
+    var modelsFilter = ""
     // Transient confirmation toast (e.g. "已复制").
     var toast: String?
 }
@@ -483,6 +489,11 @@ final class PopoverViewController: NSViewController {
     private var oauthTask: Task<Void, Never>?
     private var oauthGeneration = 0
     private var toastToken = 0
+
+    // Model pool screen: the list body is rebuilt in place on filter changes so the
+    // search field keeps focus; the generation guards stale loads across service switches.
+    private weak var modelsListStack: NSStackView?
+    private var modelsGeneration = 0
 
     override func loadView() {
         let frame = NSRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight)
@@ -531,6 +542,8 @@ final class PopoverViewController: NSViewController {
             renderAddAccount(in: root)
         case .apiKeys:
             renderAPIKeys(in: root)
+        case .models:
+            renderModels(in: root)
         }
 
         if let toast = state.toast {
@@ -1023,6 +1036,9 @@ final class PopoverViewController: NSViewController {
         menu.addItem(CallbackMenuItem(title: "API 密钥…") { [weak self] in
             self?.openAPIKeys()
         })
+        menu.addItem(CallbackMenuItem(title: "模型列表…") { [weak self] in
+            self?.openModels()
+        })
         menu.addItem(.separator())
         menu.addItem(CallbackMenuItem(title: "管理服务…") { [weak self] in
             self?.onOpenServices?()
@@ -1053,6 +1069,17 @@ final class PopoverViewController: NSViewController {
         state.apiKeysError = nil
         render()
         loadAPIKeys()
+    }
+
+    private func openModels() {
+        modelsGeneration += 1
+        state.screen = .models
+        state.modelPool = nil   // avoid flashing another service's models before the reload lands
+        state.modelPoolError = nil
+        state.modelPoolLoading = false
+        state.modelsFilter = ""
+        render()
+        loadModelPool()
     }
 
     /// The current-service title that doubles as the switcher: clicking it pops a menu of
@@ -2172,6 +2199,287 @@ final class PopoverViewController: NSViewController {
         }
     }
 
+    // MARK: - Model pool (supported models of the current service)
+
+    private func loadModelPool() {
+        guard state.settings.isConfigured else {
+            state.modelPoolError = "请先配置服务地址与管理密钥。"
+            render()
+            return
+        }
+        guard !state.modelPoolLoading else { return }
+        modelsGeneration += 1
+        let generation = modelsGeneration
+        state.modelPoolLoading = true
+        state.modelPoolError = nil
+        render()
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client = CLIProxyAPIClient(settings: settings)
+            do {
+                let pool = try await client.fetchModelPool()
+                guard self.modelsGeneration == generation, self.state.screen == .models else { return }
+                self.state.modelPool = pool
+                self.state.modelPoolLoading = false
+                self.render()
+            } catch {
+                guard self.modelsGeneration == generation, self.state.screen == .models else { return }
+                self.state.modelPoolError = self.friendlyMessage(error)
+                self.state.modelPoolLoading = false
+                self.render()
+            }
+        }
+    }
+
+    private func renderModels(in root: NSStackView) {
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        header.addArrangedSubview(circularIconButton(symbol: "chevron.left", tooltip: "Back") { [weak self] in
+            self?.showDashboard()
+        })
+        header.addArrangedSubview(label("模型列表", font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor))
+        header.addArrangedSubview(NSView())
+        let refresh = circularIconButton(symbol: "arrow.clockwise", tooltip: "Refresh") { [weak self] in
+            self?.loadModelPool()
+        }
+        refresh.isEnabled = !state.modelPoolLoading
+        header.addArrangedSubview(refresh)
+        addFullWidth(header, to: root)
+
+        addFullWidth(label(
+            "当前服务实际可用的模型，按渠道聚合；点击模型可复制 ID。",
+            font: .systemFont(ofSize: 11),
+            color: .secondaryLabelColor
+        ), to: root)
+
+        if let error = state.modelPoolError {
+            addFullWidth(messageView(text: error), to: root)
+        }
+
+        if state.modelPoolLoading && state.modelPool == nil {
+            addFullWidth(placeholderCard(symbol: "square.stack.3d.up", title: "加载中", detail: "正在汇总各账号可用的模型…"), to: root)
+        } else if let pool = state.modelPool {
+            addFullWidth(modelsSearchRow(pool), to: root)
+
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .noBorder
+            scroll.drawsBackground = false
+            scroll.scrollerStyle = .overlay
+            scroll.automaticallyAdjustsContentInsets = false
+
+            let stack = TopAlignedStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 10
+            stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 4, right: 0)
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            scroll.documentView = stack
+            NSLayoutConstraint.activate([
+                stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+            ])
+
+            modelsListStack = stack
+            populateModelsList(into: stack)
+
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+            addFullWidth(scroll, to: root)
+        }
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        root.addArrangedSubview(spacer)
+    }
+
+    private func modelsSearchRow(_ pool: ModelPoolSnapshot) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.distribution = .fill
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let field = CallbackSearchField()
+        field.placeholderString = "搜索模型"
+        field.stringValue = state.modelsFilter
+        field.font = .systemFont(ofSize: 12)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        field.onChange = { [weak self] text in
+            self?.modelsFilterChanged(text)
+        }
+        row.addArrangedSubview(field)
+
+        let counts = label(
+            "共 \(pool.distinctModelCount) 模型 · \(pool.queriedAccounts) 账号",
+            font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+            color: .tertiaryLabelColor
+        )
+        counts.setContentHuggingPriority(.required, for: .horizontal)
+        counts.setContentCompressionResistancePriority(.required, for: .horizontal)
+        row.addArrangedSubview(counts)
+        return row
+    }
+
+    private func modelsFilterChanged(_ text: String) {
+        state.modelsFilter = text
+        guard state.screen == .models, let stack = modelsListStack else { return }
+        populateModelsList(into: stack)
+    }
+
+    private func populateModelsList(into stack: NSStackView) {
+        stack.arrangedSubviews.forEach { view in
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        guard let pool = state.modelPool else { return }
+
+        @MainActor func add(_ view: NSView) {
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        let query = state.modelsFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        var shownGroups = 0
+        for group in pool.providers {
+            let entries = filteredModelEntries(group, query: query)
+            guard !entries.isEmpty else { continue }
+            shownGroups += 1
+            add(modelProviderCard(group, entries: entries))
+        }
+
+        if shownGroups == 0 {
+            if pool.providers.isEmpty {
+                add(placeholderCard(symbol: "square.stack.3d.up", title: "暂无模型", detail: "服务没有返回任何可用模型。"))
+            } else {
+                add(placeholderCard(symbol: "magnifyingglass", title: "无匹配模型", detail: "换个关键词试试。"))
+            }
+        }
+
+        if pool.failedAccounts > 0 {
+            add(noteLabel(text: "有 \(pool.failedAccounts) 个账号的模型列表获取失败，结果可能不完整。", color: .systemOrange))
+        }
+        stack.addArrangedSubview(label("同步于 \(relativeShort(pool.fetchedAt))", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
+    }
+
+    private func filteredModelEntries(_ group: ProviderModelGroup, query: String) -> [PoolModelEntry] {
+        guard !query.isEmpty else { return group.models }
+        return group.models.filter { entry in
+            let haystacks = [
+                entry.model.id,
+                entry.model.displayName ?? "",
+                entry.model.ownedBy ?? "",
+                group.provider.displayName
+            ]
+            return haystacks.contains { $0.range(of: query, options: .caseInsensitive) != nil }
+        }
+    }
+
+    private func modelProviderCard(_ group: ProviderModelGroup, entries: [PoolModelEntry]) -> NSView {
+        let card = cardView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -11)
+        ])
+
+        let accent = providerAccentColor(group.provider.accentName)
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+
+        let badge = RoundedView(fill: accent.withAlphaComponent(0.16), border: .clear, radius: 6)
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        let icon = NSImageView(image: NSImage(systemSymbolName: group.provider.symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)) ?? NSImage())
+        icon.contentTintColor = accent
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(icon)
+        NSLayoutConstraint.activate([
+            badge.widthAnchor.constraint(equalToConstant: 22),
+            badge.heightAnchor.constraint(equalToConstant: 22),
+            icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor)
+        ])
+        header.addArrangedSubview(badge)
+        header.addArrangedSubview(label(group.provider.displayName, font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor))
+        if group.accountCount > 1 {
+            header.addArrangedSubview(label("\(group.accountCount) 个账号", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
+        }
+        header.addArrangedSubview(NSView())
+        header.addArrangedSubview(pillLabel("\(entries.count)", color: .secondaryLabelColor))
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        for entry in entries {
+            let row = modelPoolRow(entry, group: group)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return card
+    }
+
+    private func modelPoolRow(_ entry: PoolModelEntry, group: ProviderModelGroup) -> NSView {
+        let clickable = ClickableCardView(fill: .clear, border: .clear, radius: 6)
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        clickable.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: clickable.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: clickable.trailingAnchor),
+            row.topAnchor.constraint(equalTo: clickable.topAnchor, constant: 1),
+            row.bottomAnchor.constraint(equalTo: clickable.bottomAnchor, constant: -1)
+        ])
+
+        let nameStack = NSStackView()
+        nameStack.orientation = .vertical
+        nameStack.alignment = .leading
+        nameStack.spacing = 1
+        let nameLabel = label(entry.displayName, font: .systemFont(ofSize: 11, weight: .medium), color: .labelColor)
+        nameLabel.lineBreakMode = .byTruncatingMiddle
+        nameStack.addArrangedSubview(nameLabel)
+        if let display = entry.model.displayName, display != entry.model.id {
+            let idLabel = label(entry.model.id, font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: .tertiaryLabelColor)
+            idLabel.lineBreakMode = .byTruncatingMiddle
+            nameStack.addArrangedSubview(idLabel)
+        }
+        nameStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(nameStack)
+        row.addArrangedSubview(NSView())
+
+        // Flag models that only part of the provider's accounts can serve.
+        if group.accountCount > 1 && entry.accountCount < group.accountCount {
+            row.addArrangedSubview(pillLabel("\(entry.accountCount)/\(group.accountCount)", color: .systemBlue))
+        }
+
+        let copyIcon = NSImageView(image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)) ?? NSImage())
+        copyIcon.contentTintColor = .tertiaryLabelColor
+        row.addArrangedSubview(copyIcon)
+
+        clickable.toolTip = "点击复制模型 ID"
+        clickable.onClick = { [weak self] in
+            self?.copyToClipboard(entry.model.id, notice: "已复制模型 ID")
+        }
+        return clickable
+    }
+
     // MARK: - Account detail
 
     private func openDetail(_ account: AccountQuota) {
@@ -3038,6 +3346,28 @@ final class CallbackButton: NSButton {
 
     @objc private func runCallback() {
         onClick?()
+    }
+}
+
+/// A search field that reports every text change (typing and the clear button) via `onChange`.
+@MainActor
+final class CallbackSearchField: NSSearchField {
+    var onChange: ((String) -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        sendsSearchStringImmediately = true
+        sendsWholeSearchString = false
+        target = self
+        action = #selector(fireChange)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    @objc private func fireChange() {
+        onChange?(stringValue)
     }
 }
 

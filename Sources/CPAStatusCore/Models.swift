@@ -456,6 +456,13 @@ public struct CPAModelDefinition: Decodable, Identifiable, Equatable, Sendable {
     public let type: String?
     public let ownedBy: String?
 
+    public init(id: String, displayName: String? = nil, type: String? = nil, ownedBy: String? = nil) {
+        self.id = id
+        self.displayName = displayName
+        self.type = type
+        self.ownedBy = ownedBy
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id
         case type
@@ -476,6 +483,161 @@ public struct CPAModelDefinition: Decodable, Identifiable, Equatable, Sendable {
         ownedBy = firstNonEmpty(
             container.lossyString(forKey: .ownedBy),
             container.lossyString(forKey: .ownedByCamel)
+        )
+    }
+}
+
+// MARK: - Service-wide model pool
+
+/// The per-account result of a `/v0/management/auth-files/models` query.
+/// `models == nil` means the query failed for that account (vs. an empty list).
+public struct AuthModelsResult: Sendable {
+    public let auth: AuthFile
+    public let models: [CPAModelDefinition]?
+
+    public init(auth: AuthFile, models: [CPAModelDefinition]?) {
+        self.auth = auth
+        self.models = models
+    }
+}
+
+/// One model within a provider group, with how many of that provider's accounts serve it.
+public struct PoolModelEntry: Identifiable, Equatable, Sendable {
+    public let model: CPAModelDefinition
+    public let accountCount: Int
+
+    public var id: String { model.id }
+
+    public init(model: CPAModelDefinition, accountCount: Int) {
+        self.model = model
+        self.accountCount = accountCount
+    }
+
+    public var displayName: String {
+        firstNonEmpty(model.displayName, model.id) ?? model.id
+    }
+}
+
+/// The deduplicated model list served by one provider's accounts.
+public struct ProviderModelGroup: Identifiable, Equatable, Sendable {
+    public let provider: ProviderInfo
+    public let models: [PoolModelEntry]
+    /// Accounts of this provider whose model list was fetched successfully.
+    public let accountCount: Int
+
+    public var id: String { provider.key }
+
+    public init(provider: ProviderInfo, models: [PoolModelEntry], accountCount: Int) {
+        self.provider = provider
+        self.models = models
+        self.accountCount = accountCount
+    }
+}
+
+/// Aggregated "what can this service serve right now" snapshot, grouped by provider.
+public struct ModelPoolSnapshot: Equatable, Sendable {
+    public let providers: [ProviderModelGroup]
+    /// Accounts whose model list was fetched successfully.
+    public let queriedAccounts: Int
+    /// Accounts whose model list query failed (results may be incomplete).
+    public let failedAccounts: Int
+    public let fetchedAt: Date
+
+    public init(providers: [ProviderModelGroup], queriedAccounts: Int, failedAccounts: Int, fetchedAt: Date = Date()) {
+        self.providers = providers
+        self.queriedAccounts = queriedAccounts
+        self.failedAccounts = failedAccounts
+        self.fetchedAt = fetchedAt
+    }
+
+    /// Distinct model IDs across every provider (case-insensitive).
+    public var distinctModelCount: Int {
+        var ids = Set<String>()
+        for group in providers {
+            for entry in group.models {
+                ids.insert(entry.model.id.lowercased())
+            }
+        }
+        return ids.count
+    }
+}
+
+/// Merges per-account model lists into per-provider deduplicated groups.
+/// Pure so it can be unit-tested; the client feeds it live query results.
+public enum ModelPoolAggregator {
+    public static func aggregate(_ results: [AuthModelsResult], fetchedAt: Date = Date()) -> ModelPoolSnapshot {
+        let grouped = Dictionary(grouping: results) { result in
+            ProviderCatalog.info(for: result.auth.normalizedProvider).key
+        }
+
+        var providers: [ProviderModelGroup] = []
+        var failedAccounts = 0
+        var queriedAccounts = 0
+
+        for (providerKey, providerResults) in grouped {
+            let info = ProviderCatalog.info(for: providerKey)
+            var order: [String] = []
+            var merged: [String: (model: CPAModelDefinition, count: Int)] = [:]
+            var successCount = 0
+
+            // Concurrent fetches return in arbitrary order; sort so the kept id
+            // casing / metadata precedence is deterministic across refreshes.
+            let orderedResults = providerResults.sorted {
+                $0.auth.id.localizedCaseInsensitiveCompare($1.auth.id) == .orderedAscending
+            }
+            for result in orderedResults {
+                guard let models = result.models else {
+                    failedAccounts += 1
+                    continue
+                }
+                successCount += 1
+                // The same account may list one id twice (alias + upstream); count it once.
+                var seenForAccount = Set<String>()
+                for model in models {
+                    let key = model.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    guard !key.isEmpty, !seenForAccount.contains(key) else { continue }
+                    seenForAccount.insert(key)
+                    if let existing = merged[key] {
+                        merged[key] = (mergeDefinitions(existing.model, model), existing.count + 1)
+                    } else {
+                        merged[key] = (model, 1)
+                        order.append(key)
+                    }
+                }
+            }
+
+            queriedAccounts += successCount
+            guard !merged.isEmpty else { continue }
+
+            let entries = order
+                .compactMap { merged[$0] }
+                .map { PoolModelEntry(model: $0.model, accountCount: $0.count) }
+                .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            providers.append(ProviderModelGroup(provider: info, models: entries, accountCount: successCount))
+        }
+
+        providers.sort { lhs, rhs in
+            if lhs.provider.priority != rhs.provider.priority {
+                return lhs.provider.priority < rhs.provider.priority
+            }
+            return lhs.provider.displayName.localizedCaseInsensitiveCompare(rhs.provider.displayName) == .orderedAscending
+        }
+
+        return ModelPoolSnapshot(
+            providers: providers,
+            queriedAccounts: queriedAccounts,
+            failedAccounts: failedAccounts,
+            fetchedAt: fetchedAt
+        )
+    }
+
+    /// Keeps the first-seen id casing and fills in missing metadata from later duplicates.
+    private static func mergeDefinitions(_ base: CPAModelDefinition, _ other: CPAModelDefinition) -> CPAModelDefinition {
+        CPAModelDefinition(
+            id: base.id,
+            displayName: firstNonEmpty(base.displayName, other.displayName),
+            type: firstNonEmpty(base.type, other.type),
+            ownedBy: firstNonEmpty(base.ownedBy, other.ownedBy)
         )
     }
 }

@@ -135,6 +135,41 @@ public struct CLIProxyAPIClient: Sendable {
         return try JSONDecoder().decode(ModelsResponse.self, from: data).models
     }
 
+    /// Aggregates the models every enabled account can serve into a per-provider snapshot —
+    /// the menu bar equivalent of the proxy's `/v1/models`, but reachable with just the
+    /// management key. Disabled accounts are skipped because the server drops them from
+    /// rotation (their registry model list is empty anyway).
+    public func fetchModelPool() async throws -> ModelPoolSnapshot {
+        let authFiles = try await fetchAuthFiles().filter { !$0.disabled }
+
+        var results: [AuthModelsResult] = []
+        let batchSize = 8
+        var start = 0
+        while start < authFiles.count {
+            let batch = Array(authFiles[start..<Swift.min(start + batchSize, authFiles.count)])
+            let batchResults = await withTaskGroup(of: AuthModelsResult.self, returning: [AuthModelsResult].self) { group in
+                for auth in batch {
+                    group.addTask {
+                        do {
+                            return AuthModelsResult(auth: auth, models: try await self.fetchModels(for: auth))
+                        } catch {
+                            return AuthModelsResult(auth: auth, models: nil)
+                        }
+                    }
+                }
+                var values: [AuthModelsResult] = []
+                for await value in group {
+                    values.append(value)
+                }
+                return values
+            }
+            results.append(contentsOf: batchResults)
+            start += batchSize
+        }
+
+        return ModelPoolAggregator.aggregate(results)
+    }
+
     /// Re-fetches live quota for a single account (used by the detail screen's refresh button).
     /// Carries the previously parsed `detail` through unchanged.
     public func refreshUsage(for auth: AuthFile, detail: AccountDetail? = nil) async -> AccountQuota {
