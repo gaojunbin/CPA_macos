@@ -38,12 +38,23 @@ public struct CLIProxyAPIClient: Sendable {
     public let settings: AppSettings
     public let timeout: TimeInterval
     private let session: URLSession
-    private static let antigravityDefaultProjectID = "bamboo-precept-lgxtn"
-    private static let antigravityModelURLs = [
+    private static let antigravityQuotaURLs = [
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+    ]
+    private static let antigravityLegacyModelURLs = [
         "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
         "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
         "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
     ]
+    private static let antigravitySubscriptionURL =
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+    private static let antigravityUserAgent =
+        "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)"
+    private static let xaiClientVersion = "0.2.93"
+    private static let xaiBillingWeeklyURL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+    private static let xaiBillingMonthlyURL = "https://cli-chat-proxy.grok.com/v1/billing"
 
     public init(settings: AppSettings, session: URLSession = .shared, timeout: TimeInterval = 45) {
         self.settings = settings
@@ -173,7 +184,8 @@ public struct CLIProxyAPIClient: Sendable {
     /// list, so they are read from their own config endpoints and merged in.
     public func fetchModelPool() async throws -> ModelPoolSnapshot {
         async let configChannels = fetchConfigChannelAccounts()
-        let authFiles = try await fetchAuthFiles().filter { !$0.disabled }
+        async let forcePrefixRoot = fetchOptionalManagementJSON(path: "/v0/management/force-model-prefix")
+        let authFiles = try await fetchAuthFiles().filter { !$0.disabled && !$0.unavailable }
 
         var results: [AuthModelsResult] = []
         let batchSize = 8
@@ -201,13 +213,162 @@ public struct CLIProxyAPIClient: Sendable {
         }
 
         let config = await configChannels
-        results.append(contentsOf: config.accounts.map { AuthModelsResult(auth: $0.auth, models: $0.models) })
+        let forceModelPrefix = boolValue((await forcePrefixRoot)?["force-model-prefix"]) ?? false
+        results.append(contentsOf: config.accounts.map { account in
+            let models: [CPAModelDefinition]
+            if forceModelPrefix, let prefix = account.auth.prefix, !prefix.isEmpty {
+                let requiredPrefix = prefix.lowercased() + "/"
+                models = account.models.filter { $0.id.lowercased().hasPrefix(requiredPrefix) }
+            } else {
+                models = account.models
+            }
+            return AuthModelsResult(auth: account.auth, models: models)
+        })
         results.append(contentsOf: config.failedSections.map { ConfigChannelSynthesizer.failureResult(providerKey: $0) })
         return ModelPoolAggregator.aggregate(results)
     }
 
+    /// Reads routing strategy, prefix policy, OAuth aliases/exclusions, config-channel
+    /// mappings, and the currently advertised model catalog into a compact snapshot.
+    public func fetchModelRoutingSnapshot() async throws -> ModelRoutingSnapshot {
+        async let authTask = fetchAuthFilesAndDetails()
+        async let configTask = fetchConfigChannelAccounts()
+        async let modelPoolTask = fetchModelPool()
+        async let aliasesTask = fetchOptionalManagementJSON(path: "/v0/management/oauth-model-alias")
+        async let excludedTask = fetchOptionalManagementJSON(path: "/v0/management/oauth-excluded-models")
+        async let strategyTask = fetchOptionalManagementJSON(path: "/v0/management/routing/strategy")
+        async let forcePrefixTask = fetchOptionalManagementJSON(path: "/v0/management/force-model-prefix")
+
+        let authResult = try await authTask
+        let authFiles = authResult.files
+        let routingAuthFiles = authFiles.filter { !$0.disabled }
+        let downloadableRoutingAuthFiles = routingAuthFiles.filter {
+            authResult.details[$0.id]?.runtimeOnly != true
+        }
+        async let accountOverridesTask = fetchOAuthAccountRoutingOverrides(downloadableRoutingAuthFiles)
+        let config = await configTask
+        let modelPool = try await modelPoolTask
+        let aliasesRoot = await aliasesTask ?? [:]
+        let excludedRoot = await excludedTask ?? [:]
+        let strategyRoot = await strategyTask ?? [:]
+        let forcePrefixRoot = await forcePrefixTask ?? [:]
+        let forceModelPrefix = boolValue(forcePrefixRoot["force-model-prefix"]) ?? false
+        let accountOverrides = await accountOverridesTask
+
+        let aliases = OAuthModelRoutingParser.aliases(root: aliasesRoot)
+        let excluded = OAuthModelRoutingParser.excludedModels(root: excludedRoot)
+        var allKeys = Set<String>()
+        var authByKey: [String: [AuthFile]] = [:]
+        var configByKey: [String: [ConfigChannelAccount]] = [:]
+        var routesByKey: [String: [ModelRouteDefinition]] = [:]
+        var excludedByKey: [String: [String]] = [:]
+        var advertisedByKey: [String: Int] = [:]
+        var globalAliasesByKey: [String: [OAuthModelAliasEntry]] = [:]
+
+        for auth in routingAuthFiles {
+            let key = Self.canonicalRoutingKey(auth.normalizedProvider)
+            authByKey[key, default: []].append(auth)
+            allKeys.insert(key)
+        }
+        for account in config.accounts {
+            let key = Self.canonicalRoutingKey(account.auth.normalizedProvider)
+            configByKey[key, default: []].append(account)
+            allKeys.insert(key)
+        }
+        for (key, accounts) in configByKey {
+            routesByKey[key, default: []].append(contentsOf: ModelRoutingResolver.configRoutes(
+                accounts: accounts,
+                forceModelPrefix: forceModelPrefix
+            ))
+        }
+        for (rawProvider, entries) in aliases {
+            let key = Self.canonicalRoutingKey(rawProvider)
+            globalAliasesByKey[key, default: []].append(contentsOf: entries)
+            allKeys.insert(key)
+        }
+        for key in Set(authByKey.keys).union(globalAliasesByKey.keys) {
+            routesByKey[key, default: []].append(contentsOf: ModelRoutingResolver.oauthRoutes(
+                globalEntries: globalAliasesByKey[key] ?? [],
+                auths: authByKey[key] ?? [],
+                accountOverrides: accountOverrides,
+                forceModelPrefix: forceModelPrefix
+            ))
+        }
+        for (rawProvider, patterns) in excluded {
+            let key = Self.canonicalRoutingKey(rawProvider)
+            excludedByKey[key, default: []].append(contentsOf: patterns)
+            allKeys.insert(key)
+        }
+        for group in modelPool.providers {
+            let key = Self.canonicalRoutingKey(group.provider.key)
+            advertisedByKey[key, default: 0] += group.models.count
+            allKeys.insert(key)
+        }
+
+        let providers = allKeys.compactMap { key -> ProviderRoutingGroup? in
+            let auths = authByKey[key] ?? []
+            let configs = configByKey[key] ?? []
+            let routes = ModelRoutingResolver.deduplicated(routesByKey[key] ?? []).sorted { lhs, rhs in
+                let aliasOrder = lhs.publicModelID.localizedCaseInsensitiveCompare(rhs.publicModelID)
+                if aliasOrder != .orderedSame { return aliasOrder == .orderedAscending }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+            let prefixes = Self.uniqueStrings(
+                auths.compactMap {
+                    ModelRoutingResolver.effectivePrefix(for: $0, accountOverrides: accountOverrides)
+                } + configs.compactMap { $0.auth.prefix }
+            )
+            let priorities = Array(Set(
+                auths.compactMap {
+                    ModelRoutingResolver.effectivePriority(for: $0, accountOverrides: accountOverrides)
+                } + configs.compactMap { $0.auth.priority }
+            )).sorted(by: >)
+            let baseURLs = Self.uniqueStrings(configs.compactMap(\.baseURL))
+            let proxyURLs = Self.uniqueStrings(
+                auths.compactMap {
+                    ModelRoutingResolver.effectiveProxyURL(for: $0, accountOverrides: accountOverrides)
+                } + configs.compactMap { ModelRoutingResolver.sanitizedEndpoint($0.auth.proxyURL) }
+            )
+            let notes = Self.uniqueStrings(auths.compactMap {
+                ModelRoutingResolver.effectiveNote(for: $0, accountOverrides: accountOverrides)
+            })
+            let mergedExcludedModels = ModelRoutingResolver.mergedExcludedModels(
+                global: excludedByKey[key] ?? [],
+                auths: auths,
+                accountOverrides: accountOverrides
+            )
+            return ProviderRoutingGroup(
+                provider: ProviderCatalog.info(for: key),
+                accountCount: auths.count + configs.count,
+                advertisedModelCount: advertisedByKey[key] ?? 0,
+                routes: routes,
+                excludedModels: mergedExcludedModels,
+                prefixes: prefixes,
+                priorities: priorities,
+                baseURLs: baseURLs,
+                proxyURLs: proxyURLs,
+                notes: notes,
+                officialAPIAccounts: auths.filter {
+                    ModelRoutingResolver.effectiveUsingAPI(for: $0, accountOverrides: accountOverrides) == true
+                }.count
+            )
+        }.sorted { lhs, rhs in
+            if lhs.provider.priority != rhs.provider.priority {
+                return lhs.provider.priority < rhs.provider.priority
+            }
+            return lhs.provider.displayName.localizedCaseInsensitiveCompare(rhs.provider.displayName) == .orderedAscending
+        }
+
+        return ModelRoutingSnapshot(
+            strategy: firstString(strategyRoot["strategy"]) ?? "round-robin",
+            forceModelPrefix: forceModelPrefix,
+            providers: providers,
+            failedSections: config.failedSections
+        )
+    }
+
     /// Reads the config-based channels (openai-compatibility plus the claude / codex /
-    /// gemini / vertex api-key sections) and synthesizes one account per credential.
+    /// gemini / interactions / vertex api-key sections) and synthesizes one account per credential.
     /// Failed sections are reported by name; a 404 (endpoint absent on older servers)
     /// counts as "no such channels".
     public func fetchConfigChannelAccounts() async -> ConfigChannelFetch {
@@ -276,6 +437,119 @@ public struct CLIProxyAPIClient: Sendable {
             throw PoolClientError.invalidResponse("\(path) did not return a JSON object")
         }
         return object
+    }
+
+    private func fetchOptionalManagementJSON(path: String) async -> [String: Any]? {
+        try? await fetchManagementJSON(path: path)
+    }
+
+    private static func canonicalRoutingKey(_ raw: String) -> String {
+        let normalized = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        switch normalized {
+        case "anthropic": return "claude"
+        case "grok", "x-ai": return "xai"
+        default: return ProviderCatalog.info(for: normalized).key
+        }
+    }
+
+    private static func uniqueStrings(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.compactMap { value in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else { return nil }
+            return trimmed
+        }
+    }
+
+    /// Downloads only route metadata for file-backed OAuth accounts. Each raw
+    /// payload is parsed and discarded inside its task; failures are intentionally
+    /// omitted so callers fall back to provider-global routing configuration.
+    private func fetchOAuthAccountRoutingOverrides(
+        _ authFiles: [AuthFile]
+    ) async -> [String: OAuthAccountRoutingOverride] {
+        let candidates = authFiles.filter { Self.downloadableAuthJSONName(for: $0) != nil }
+        guard !candidates.isEmpty else { return [:] }
+
+        var overrides: [String: OAuthAccountRoutingOverride] = [:]
+        let batchSize = 8
+        var start = 0
+        while start < candidates.count {
+            let batch = Array(candidates[start..<Swift.min(start + batchSize, candidates.count)])
+            let results = await withTaskGroup(
+                of: (String, OAuthAccountRoutingOverride?).self,
+                returning: [(String, OAuthAccountRoutingOverride?)].self
+            ) { group in
+                for auth in batch {
+                    group.addTask {
+                        (auth.id, await self.fetchOAuthAccountRoutingOverride(for: auth))
+                    }
+                }
+                var values: [(String, OAuthAccountRoutingOverride?)] = []
+                for await value in group {
+                    values.append(value)
+                }
+                return values
+            }
+            for (authID, override) in results {
+                if let override {
+                    overrides[authID] = override
+                }
+            }
+            start += batchSize
+        }
+        return overrides
+    }
+
+    private func fetchOAuthAccountRoutingOverride(
+        for auth: AuthFile
+    ) async -> OAuthAccountRoutingOverride? {
+        guard let name = Self.downloadableAuthJSONName(for: auth) else { return nil }
+        do {
+            let url = try Self.authFileDownloadURL(baseURL: settings.baseURL, name: name)
+            var request = URLRequest(url: url, timeoutInterval: timeout)
+            request.httpMethod = "GET"
+            applyManagementHeaders(to: &request)
+            let payload = try await data(for: request)
+            return OAuthAuthFileRoutingParser.parse(
+                data: payload,
+                provider: Self.canonicalRoutingKey(auth.normalizedProvider)
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private static func downloadableAuthJSONName(for auth: AuthFile) -> String? {
+        let name = auth.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.lowercased().hasSuffix(".json"),
+              !name.contains("/"),
+              !name.contains("\\")
+        else {
+            return nil
+        }
+        return name
+    }
+
+    private static func authFileDownloadURL(baseURL: String, name: String) throws -> URL {
+        var components = URLComponents(
+            url: try managementURL(baseURL: baseURL, path: "/v0/management/auth-files/download"),
+            resolvingAgainstBaseURL: false
+        )
+        var unreserved = CharacterSet.alphanumerics
+        unreserved.insert(charactersIn: "-._~")
+        guard let encodedName = name.addingPercentEncoding(withAllowedCharacters: unreserved) else {
+            throw PoolClientError.invalidResponse("invalid auth-file download name")
+        }
+        components?.percentEncodedQuery = "name=\(encodedName)"
+        guard let url = components?.url else {
+            throw PoolClientError.invalidResponse("invalid auth-file download URL")
+        }
+        return url
     }
 
     private static func isNotFound(_ error: Error) -> Bool {
@@ -394,30 +668,61 @@ public struct CLIProxyAPIClient: Sendable {
             headers["ChatGPT-Account-Id"] = accountID
         }
 
-        let payload = APICallRequest(
+        let usagePayload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
             url: "https://chatgpt.com/backend-api/wham/usage",
             header: headers,
             data: nil
         )
-        return try await fetchUsageViaAPICall(payload: payload)
+        var resetHeaders = headers
+        resetHeaders["OpenAI-Beta"] = "codex-1"
+        resetHeaders["Originator"] = "Codex Desktop"
+        let resetPayload = APICallRequest(
+            authIndex: auth.authIndex,
+            method: "GET",
+            url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            header: resetHeaders,
+            data: nil
+        )
+
+        async let usageTask = fetchAPICallEnvelope(payload: usagePayload)
+        async let resetTask = fetchOptionalAPICallEnvelope(payload: resetPayload)
+        let usageEnvelope = try await usageTask
+        let resetEnvelope = await resetTask
+
+        guard (200..<300).contains(usageEnvelope.statusCode) else {
+            throw PoolClientError.httpStatus(usageEnvelope.statusCode, usageEnvelope.body)
+        }
+        var usageObject = Self.jsonObject(from: usageEnvelope.body) ?? [:]
+        if let resetEnvelope,
+           (200..<300).contains(resetEnvelope.statusCode),
+           let resetObject = Self.jsonObject(from: resetEnvelope.body) {
+            usageObject["rate_limit_reset_credits"] = resetObject
+        }
+        if let snapshot = UsageParser.parse(try jsonString(usageObject)) {
+            return snapshot
+        }
+        throw PoolClientError.invalidResponse("empty Codex quota")
     }
 
     private func fetchAntigravityUsage(auth: AuthFile) async throws -> UsageSnapshot {
-        let projectID = await antigravityProjectID(for: auth)
+        guard let projectID = await antigravityProjectID(for: auth) else {
+            throw PoolClientError.invalidResponse("missing Antigravity project_id")
+        }
         let payloadBody = try jsonString(["project": projectID])
         let headers = [
             "Authorization": "Bearer $TOKEN$",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/1.21.9 darwin/arm64"
+            "User-Agent": Self.antigravityUserAgent
         ]
 
+        async let subscriptionTask = fetchAntigravitySubscription(auth: auth, headers: headers)
         var lastError: Error?
         var emptySnapshot: UsageSnapshot?
         var sawSuccessfulResponse = false
 
-        for url in Self.antigravityModelURLs {
+        for url in Self.antigravityQuotaURLs {
             let payload = APICallRequest(
                 authIndex: auth.authIndex,
                 method: "POST",
@@ -434,13 +739,46 @@ public struct CLIProxyAPIClient: Sendable {
                 }
 
                 sawSuccessfulResponse = true
-                if let snapshot = UsageParser.parse(envelope.body) {
+                let quotaObject = Self.jsonObject(from: envelope.body) ?? [:]
+                let subscriptionObject = await subscriptionTask ?? [:]
+                let combined: [String: Any] = [
+                    "_provider": "antigravity",
+                    "quota": quotaObject,
+                    "subscription": subscriptionObject
+                ]
+                if let snapshot = UsageParser.parse(try jsonString(combined)) {
                     if snapshot.hasQuotaSignal {
                         return snapshot
                     }
                     emptySnapshot = snapshot
                 } else {
-                    lastError = PoolClientError.invalidResponse("empty Antigravity model quota")
+                    lastError = PoolClientError.invalidResponse("empty Antigravity quota summary")
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        // Older CLIProxyAPI deployments and cached management panels still use the
+        // model-map endpoint. Keep it as a compatibility fallback after the current
+        // summary endpoint has been attempted.
+        for url in Self.antigravityLegacyModelURLs {
+            let payload = APICallRequest(
+                authIndex: auth.authIndex,
+                method: "POST",
+                url: url,
+                header: headers,
+                data: payloadBody
+            )
+            do {
+                let envelope = try await fetchAPICallEnvelope(payload: payload)
+                guard (200..<300).contains(envelope.statusCode) else {
+                    lastError = PoolClientError.httpStatus(envelope.statusCode, envelope.body)
+                    continue
+                }
+                sawSuccessfulResponse = true
+                if let snapshot = UsageParser.parse(envelope.body), snapshot.hasQuotaSignal {
+                    return snapshot
                 }
             } catch {
                 lastError = error
@@ -459,30 +797,71 @@ public struct CLIProxyAPIClient: Sendable {
         throw lastError ?? PoolClientError.invalidResponse("empty Antigravity model quota")
     }
 
+    private func fetchAntigravitySubscription(
+        auth: AuthFile,
+        headers: [String: String]
+    ) async -> [String: Any]? {
+        let body = try? jsonString(["metadata": ["ideType": "ANTIGRAVITY"]])
+        let payload = APICallRequest(
+            authIndex: auth.authIndex,
+            method: "POST",
+            url: Self.antigravitySubscriptionURL,
+            header: headers,
+            data: body
+        )
+        guard let envelope = try? await fetchAPICallEnvelope(payload: payload),
+              (200..<300).contains(envelope.statusCode)
+        else {
+            return nil
+        }
+        guard let root = Self.jsonObject(from: envelope.body) else { return nil }
+        let paidTier = firstDictionary(root["paidTier"], root["paid_tier"])
+        let currentTier = firstDictionary(root["currentTier"], root["current_tier"])
+        let tier = (firstString(paidTier?["id"]) == nil ? currentTier : paidTier) ?? [:]
+        let tierID = firstString(tier["id"])
+        let plan: String
+        switch tierID?.lowercased() {
+        case "free-tier": plan = "free"
+        case "g1-pro-tier": plan = "pro"
+        case "g1-ultra-tier": plan = "ultra"
+        case "g1-ultra-lite-tier": plan = "ultra-lite"
+        default: plan = "unknown"
+        }
+        var normalized: [String: Any] = ["plan": plan]
+        if let tierID { normalized["tierId"] = tierID }
+        if let tierName = firstString(tier["name"]) { normalized["tierName"] = tierName }
+        if let paidTier { normalized["paidTier"] = paidTier }
+        return normalized
+    }
+
     private func fetchClaudeUsage(auth: AuthFile) async throws -> UsageSnapshot {
         let headers = [
             "Authorization": "Bearer $TOKEN$",
             "Content-Type": "application/json",
             "anthropic-beta": "oauth-2025-04-20"
         ]
-        let usageEnvelope = try await fetchAPICallEnvelope(payload: APICallRequest(
+        let usagePayload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
             url: "https://api.anthropic.com/api/oauth/usage",
             header: headers,
             data: nil
-        ))
-        guard (200..<300).contains(usageEnvelope.statusCode) else {
-            throw PoolClientError.httpStatus(usageEnvelope.statusCode, usageEnvelope.body)
-        }
-
-        let profileEnvelope = try? await fetchAPICallEnvelope(payload: APICallRequest(
+        )
+        let profilePayload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
             url: "https://api.anthropic.com/api/oauth/profile",
             header: headers,
             data: nil
-        ))
+        )
+        async let usageTask = fetchAPICallEnvelope(payload: usagePayload)
+        async let profileTask = fetchOptionalAPICallEnvelope(payload: profilePayload)
+        let usageEnvelope = try await usageTask
+        let profileEnvelope = await profileTask
+        guard (200..<300).contains(usageEnvelope.statusCode) else {
+            throw PoolClientError.httpStatus(usageEnvelope.statusCode, usageEnvelope.body)
+        }
+
         let usageObject = Self.jsonObject(from: usageEnvelope.body) ?? [:]
         let profileObject = profileEnvelope.flatMap { envelope -> [String: Any]? in
             guard (200..<300).contains(envelope.statusCode) else {
@@ -513,14 +892,59 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     private func fetchXAIUsage(auth: AuthFile) async throws -> UsageSnapshot {
-        let payload = APICallRequest(
+        var headers = [
+            "Authorization": "Bearer $TOKEN$",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": Self.xaiClientVersion,
+            "Accept": "*/*",
+            "User-Agent": "grok-pager/\(Self.xaiClientVersion) grok-shell/\(Self.xaiClientVersion) (macos; aarch64)"
+        ]
+        if let userID = await xaiUserID(for: auth) {
+            headers["x-userid"] = userID
+        }
+
+        let weeklyPayload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
-            url: "https://cli-chat-proxy.grok.com/v1/billing",
-            header: ["Authorization": "Bearer $TOKEN$"],
+            url: Self.xaiBillingWeeklyURL,
+            header: headers,
             data: nil
         )
-        return try await fetchUsageViaAPICall(payload: payload)
+        let monthlyPayload = APICallRequest(
+            authIndex: auth.authIndex,
+            method: "GET",
+            url: Self.xaiBillingMonthlyURL,
+            header: headers,
+            data: nil
+        )
+        async let weeklyTask = fetchOptionalAPICallEnvelope(payload: weeklyPayload)
+        async let monthlyTask = fetchOptionalAPICallEnvelope(payload: monthlyPayload)
+        let weeklyEnvelope = await weeklyTask
+        let monthlyEnvelope = await monthlyTask
+
+        let weeklyObject = weeklyEnvelope.flatMap { envelope in
+            (200..<300).contains(envelope.statusCode) ? Self.jsonObject(from: envelope.body) : nil
+        }
+        let monthlyObject = monthlyEnvelope.flatMap { envelope in
+            (200..<300).contains(envelope.statusCode) ? Self.jsonObject(from: envelope.body) : nil
+        }
+        guard weeklyObject != nil || monthlyObject != nil else {
+            let failed = weeklyEnvelope ?? monthlyEnvelope
+            throw PoolClientError.httpStatus(failed?.statusCode ?? 502, failed?.body ?? "empty Grok billing response")
+        }
+        let combined: [String: Any] = [
+            "_provider": "xai",
+            "weekly": weeklyObject ?? [:],
+            "monthly": monthlyObject ?? [:]
+        ]
+        if let snapshot = UsageParser.parse(try jsonString(combined)), snapshot.hasQuotaSignal {
+            return snapshot
+        }
+        throw PoolClientError.invalidResponse("empty Grok quota")
+    }
+
+    private func fetchOptionalAPICallEnvelope(payload: APICallRequest) async -> APICallEnvelope? {
+        try? await fetchAPICallEnvelope(payload: payload)
     }
 
     private func fetchUsageViaAPICall(payload: APICallRequest) async throws -> UsageSnapshot {
@@ -561,7 +985,7 @@ public struct CLIProxyAPIClient: Sendable {
         throw lastError ?? PoolClientError.invalidResponse("empty quota response")
     }
 
-    private func antigravityProjectID(for auth: AuthFile) async -> String {
+    private func antigravityProjectID(for auth: AuthFile) async -> String? {
         if let projectID = auth.projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !projectID.isEmpty {
             return projectID
@@ -570,19 +994,29 @@ public struct CLIProxyAPIClient: Sendable {
            let projectID = Self.projectID(fromAuthFileBody: body) {
             return projectID
         }
-        return Self.antigravityDefaultProjectID
+        return nil
+    }
+
+    private func xaiUserID(for auth: AuthFile) async -> String? {
+        guard let body = try? await downloadAuthFile(named: auth.name),
+              let data = body.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return firstNonEmpty(
+            firstString(root["sub"]),
+            firstString(root["subject"]),
+            firstString(root["user_id"]),
+            firstString(root["userId"]),
+            firstString(nested(root, "oauth", "sub")),
+            firstString(nested(root, "user", "sub")),
+            firstString(nested(root, "user", "id"))
+        )
     }
 
     private func downloadAuthFile(named name: String) async throws -> String {
-        var components = URLComponents(
-            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/download"),
-            resolvingAgainstBaseURL: false
-        )
-        components?.queryItems = [URLQueryItem(name: "name", value: name)]
-        guard let url = components?.url else {
-            throw PoolClientError.invalidResponse("invalid auth-file download URL")
-        }
-
+        let url = try Self.authFileDownloadURL(baseURL: settings.baseURL, name: name)
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "GET"
         applyManagementHeaders(to: &request)
@@ -720,11 +1154,13 @@ private struct APICallEnvelope {
 //
 // These live in the same file as `CLIProxyAPIClient` so they can reuse its private request
 // helpers (`applyManagementHeaders`, `data(for:)`). The management server performs the actual
-// token exchange and persistence; the client only relays callbacks and polls for completion.
+// token exchange and persistence; the client polls every flow and only relays callbacks for
+// redirect-based providers.
 public extension CLIProxyAPIClient {
     /// Requests an authorization URL and opaque session state for the given provider.
     /// Note: `is_webui` is intentionally omitted — the server would otherwise spin up its own
-    /// loopback forwarder; this app captures the redirect locally instead.
+    /// loopback forwarder. Redirect providers are completed by a manually pasted callback URL,
+    /// while device providers are completed by server-side polling.
     func requestOAuthURL(for provider: OAuthProvider) async throws -> OAuthAuthURL {
         guard settings.isConfigured else { throw PoolClientError.notConfigured }
         let url = try Self.managementURL(baseURL: settings.baseURL, path: provider.authPath)
@@ -738,7 +1174,13 @@ public extension CLIProxyAPIClient {
         guard let authURL = firstString(object["url"]), !authURL.isEmpty else {
             throw PoolClientError.invalidResponse(firstString(object["error"]) ?? "auth-url response missing url")
         }
-        return OAuthAuthURL(url: authURL, state: firstString(object["state"]) ?? "")
+        return OAuthAuthURL(
+            url: authURL,
+            state: firstString(object["state"]) ?? "",
+            flow: firstString(object["flow"]),
+            userCode: firstString(firstValue(object["user_code"], object["userCode"])),
+            expiresIn: intValue(firstValue(object["expires_in"], object["expiresIn"]))
+        )
     }
 
     /// Relays a captured authorization `code` + `state` to the management server.

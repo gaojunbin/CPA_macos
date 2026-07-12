@@ -72,14 +72,17 @@ final class ModelPoolTests: XCTestCase {
         let codex = try authFile(name: "codex-a.json", provider: "codex")
         let snapshot = ModelPoolAggregator.aggregate([
             AuthModelsResult(auth: codex, models: [
-                CPAModelDefinition(id: "gpt-5.2"),
-                CPAModelDefinition(id: "gpt-5.2")
+                CPAModelDefinition(id: "gpt-5.2", contextLength: 200_000),
+                CPAModelDefinition(id: "gpt-5.2", description: "Merged metadata", maxCompletionTokens: 64_000)
             ])
         ])
 
         let group = try XCTUnwrap(snapshot.providers.first)
         XCTAssertEqual(group.models.count, 1)
         XCTAssertEqual(group.models.first?.accountCount, 1)
+        XCTAssertEqual(group.models.first?.model.description, "Merged metadata")
+        XCTAssertEqual(group.models.first?.model.contextLength, 200_000)
+        XCTAssertEqual(group.models.first?.model.maxCompletionTokens, 64_000)
     }
 
     func testSortsModelsByDisplayNameWithinProvider() throws {
@@ -93,5 +96,107 @@ final class ModelPoolTests: XCTestCase {
 
         let group = try XCTUnwrap(snapshot.providers.first)
         XCTAssertEqual(group.models.map(\.displayName), ["Alpha", "Beta"])
+    }
+
+    func testDecodesSnakeAndCamelCaseModelCapabilities() throws {
+        let data = Data("""
+        {"models": [
+          {
+            "id": "claude-capable",
+            "description": "Long-context reasoning model",
+            "context_length": "200000",
+            "max_completion_tokens": 64000,
+            "supported_input_modalities": ["text", "image"],
+            "supported_output_modalities": ["text"],
+            "supports_web_search": "true",
+            "thinking": {
+              "min": "1024",
+              "max": 128000,
+              "zero_allowed": true,
+              "dynamic_allowed": "false",
+              "levels": ["low", "high"]
+            }
+          },
+          {
+            "id": "gemini-capable",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": "65536",
+            "supportedInputModalities": ["TEXT", "IMAGE", "AUDIO"],
+            "supportedOutputModalities": ["TEXT", "IMAGE"],
+            "supportsWebSearch": false,
+            "thinking": {
+              "minTokens": 128,
+              "maxTokens": 32768,
+              "zeroAllowed": false,
+              "dynamicAllowed": true,
+              "levels": "minimal, medium, high"
+            }
+          }
+        ]}
+        """.utf8)
+
+        let models = try JSONDecoder().decode(ModelsResponse.self, from: data).models
+        let claude = try XCTUnwrap(models.first)
+        XCTAssertEqual(claude.description, "Long-context reasoning model")
+        XCTAssertEqual(claude.contextLength, 200_000)
+        XCTAssertEqual(claude.maxCompletionTokens, 64_000)
+        XCTAssertEqual(claude.supportedInputModalities, ["text", "image"])
+        XCTAssertEqual(claude.supportedOutputModalities, ["text"])
+        XCTAssertEqual(claude.supportsWebSearch, true)
+        XCTAssertEqual(claude.thinking?.min, 1_024)
+        XCTAssertEqual(claude.thinking?.max, 128_000)
+        XCTAssertEqual(claude.thinking?.zeroAllowed, true)
+        XCTAssertEqual(claude.thinking?.dynamicAllowed, false)
+        XCTAssertEqual(claude.thinking?.levels, ["low", "high"])
+
+        let gemini = try XCTUnwrap(models.last)
+        XCTAssertEqual(gemini.inputTokenLimit, 1_048_576)
+        XCTAssertEqual(gemini.outputTokenLimit, 65_536)
+        XCTAssertEqual(gemini.supportedInputModalities, ["TEXT", "IMAGE", "AUDIO"])
+        XCTAssertEqual(gemini.supportedOutputModalities, ["TEXT", "IMAGE"])
+        XCTAssertEqual(gemini.supportsWebSearch, false)
+        XCTAssertEqual(gemini.thinking?.minimumTokens, 128)
+        XCTAssertEqual(gemini.thinking?.maximumTokens, 32_768)
+        XCTAssertEqual(gemini.thinking?.dynamicAllowed, true)
+        XCTAssertEqual(gemini.thinking?.levels, ["minimal", "medium", "high"])
+    }
+
+    func testAggregationFillsMissingCapabilityMetadataAcrossAccounts() throws {
+        let first = try authFile(name: "codex-a.json", provider: "codex")
+        let second = try authFile(name: "codex-b.json", provider: "codex")
+        let snapshot = ModelPoolAggregator.aggregate([
+            AuthModelsResult(auth: first, models: [
+                CPAModelDefinition(
+                    id: "gpt-capable",
+                    contextLength: 200_000,
+                    supportedInputModalities: ["text"],
+                    thinking: ModelThinkingCapabilities(min: 1_024, levels: ["low"])
+                )
+            ]),
+            AuthModelsResult(auth: second, models: [
+                CPAModelDefinition(
+                    id: "GPT-CAPABLE",
+                    description: "Capability metadata",
+                    maxCompletionTokens: 64_000,
+                    supportedInputModalities: ["image"],
+                    supportedOutputModalities: ["text", "image"],
+                    supportsWebSearch: true,
+                    thinking: ModelThinkingCapabilities(max: 128_000, dynamicAllowed: true, levels: ["high"])
+                )
+            ])
+        ])
+
+        let model = try XCTUnwrap(snapshot.providers.first?.models.first?.model)
+        XCTAssertEqual(model.id, "gpt-capable")
+        XCTAssertEqual(model.description, "Capability metadata")
+        XCTAssertEqual(model.contextLength, 200_000)
+        XCTAssertEqual(model.maxCompletionTokens, 64_000)
+        XCTAssertEqual(model.supportedInputModalities, ["text", "image"])
+        XCTAssertEqual(model.supportedOutputModalities, ["text", "image"])
+        XCTAssertEqual(model.supportsWebSearch, true)
+        XCTAssertEqual(model.thinking?.min, 1_024)
+        XCTAssertEqual(model.thinking?.max, 128_000)
+        XCTAssertEqual(model.thinking?.dynamicAllowed, true)
+        XCTAssertEqual(model.thinking?.levels, ["low", "high"])
     }
 }

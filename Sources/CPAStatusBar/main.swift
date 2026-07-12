@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configurePopover() {
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 380, height: 560)
+        popover.contentSize = NSSize(width: 420, height: 620)
         popover.contentViewController = controller
 
         controller.onRefresh = { [weak self] in
@@ -354,9 +354,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let percent = controller.state.snapshot?.summary.primaryAverage
-        let symbolName = gaugeSymbol(for: percent)
-        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "CLIProxyAPI quota")?
+        let health = controller.state.snapshot?.healthRatio
+        let symbolName = healthSymbol(for: health)
+        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "CLIProxyAPI health")?
             .withSymbolConfiguration(config)
         image?.isTemplate = true
         button.image = image
@@ -373,8 +373,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.attributedTitle = menuBarTitle("  !", color: .systemRed)
             return
         }
-        if let percent {
-            button.attributedTitle = menuBarTitle("  \(displayPercent(percent))", color: menuBarColor(for: percent))
+        if let health, health.total > 0 {
+            button.attributedTitle = menuBarTitle("  \(health.displayValue)", color: menuBarColor(for: health))
             return
         }
         button.attributedTitle = NSAttributedString(string: "")
@@ -388,18 +388,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSAttributedString(string: text, attributes: attributes)
     }
 
-    private func gaugeSymbol(for percent: Double?) -> String {
-        guard let percent else { return "gauge.with.dots.needle.50percent" }
-        if percent >= 67 { return "gauge.with.dots.needle.67percent" }
-        if percent >= 33 { return "gauge.with.dots.needle.50percent" }
-        if percent >= 1 { return "gauge.with.dots.needle.33percent" }
-        return "gauge.with.dots.needle.0percent"
+    private func healthSymbol(for health: AccountHealthRatio?) -> String {
+        guard let health, health.total > 0 else { return "circle.dashed" }
+        if health.isFullyHealthy { return "checkmark.circle" }
+        if health.healthy == 0 { return "xmark.circle" }
+        return "exclamationmark.circle"
     }
 
-    private func menuBarColor(for percent: Double) -> NSColor {
-        if percent <= 15 { return .systemRed }
-        if percent <= 35 { return .systemOrange }
-        return .labelColor
+    private func menuBarColor(for health: AccountHealthRatio) -> NSColor {
+        if health.isFullyHealthy { return .labelColor }
+        if health.healthy == 0 { return .systemRed }
+        return .systemOrange
     }
 }
 
@@ -411,6 +410,7 @@ enum PopoverScreen {
     case addAccount
     case apiKeys
     case models
+    case routing
 }
 
 /// Tracks an in-flight OAuth login started from the menu bar.
@@ -426,6 +426,9 @@ struct OAuthFlow {
     var phase: Phase
     var authURL: String?
     var sessionState: String?
+    var usesDeviceFlow = false
+    var userCode: String?
+    var expiresIn: Int?
     var errorMessage: String?
 }
 
@@ -465,6 +468,10 @@ struct PopoverState {
     var modelPoolLoading = false
     var modelPoolError: String?
     var modelsFilter = ""
+    // Upstream routing configuration
+    var routingSnapshot: ModelRoutingSnapshot?
+    var routingLoading = false
+    var routingError: String?
     // Transient confirmation toast (e.g. "已复制").
     var toast: String?
 }
@@ -482,8 +489,8 @@ final class PopoverViewController: NSViewController {
     /// Asks the app delegate to keep the popover open across the browser hand-off during OAuth.
     var onHoldOpen: ((Bool) -> Void)?
 
-    private let popoverWidth: CGFloat = 380
-    private let popoverHeight: CGFloat = 560
+    private let popoverWidth: CGFloat = 420
+    private let popoverHeight: CGFloat = 620
 
     // OAuth flow coordination.
     private var oauthTask: Task<Void, Never>?
@@ -494,6 +501,7 @@ final class PopoverViewController: NSViewController {
     // search field keeps focus; the generation guards stale loads across service switches.
     private weak var modelsListStack: NSStackView?
     private var modelsGeneration = 0
+    private var routingGeneration = 0
 
     override func loadView() {
         let frame = NSRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight)
@@ -506,19 +514,23 @@ final class PopoverViewController: NSViewController {
         vibrancy.autoresizingMask = [.width, .height]
         container.addSubview(vibrancy)
 
+        let glow = AmbientGlowView(frame: frame)
+        glow.autoresizingMask = [.width, .height]
+        container.addSubview(glow)
+
         view = container
     }
 
     func render() {
         view.subviews
-            .filter { !($0 is NSVisualEffectView) }
+            .filter { !($0 is NSVisualEffectView) && !($0 is AmbientGlowView) }
             .forEach { $0.removeFromSuperview() }
 
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 14
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 14, right: 16)
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 12, right: 14)
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
 
@@ -544,6 +556,8 @@ final class PopoverViewController: NSViewController {
             renderAPIKeys(in: root)
         case .models:
             renderModels(in: root)
+        case .routing:
+            renderRouting(in: root)
         }
 
         if let toast = state.toast {
@@ -625,7 +639,7 @@ final class PopoverViewController: NSViewController {
         }
 
         if let snapshot = state.snapshot {
-            addFullWidth(summaryView(snapshot.summary), to: root)
+            addFullWidth(overviewView(snapshot), to: root)
             addFullWidth(providerSections(snapshot.providers), to: root)
         } else {
             addFullWidth(emptyDashboardView(), to: root)
@@ -634,6 +648,311 @@ final class PopoverViewController: NSViewController {
             spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
             root.addArrangedSubview(spacer)
         }
+    }
+
+    private func renderRouting(in root: NSStackView) {
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        header.addArrangedSubview(circularIconButton(symbol: "chevron.left", tooltip: "Back") { [weak self] in
+            self?.showDashboard()
+        })
+        header.addArrangedSubview(label("上游模型路由", font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor))
+        header.addArrangedSubview(NSView())
+        let refresh = circularIconButton(symbol: "arrow.clockwise", tooltip: "Refresh") { [weak self] in
+            self?.loadRoutingSnapshot()
+        }
+        refresh.isEnabled = !state.routingLoading
+        header.addArrangedSubview(refresh)
+        addFullWidth(header, to: root)
+
+        addFullWidth(label(
+            "展示客户端模型 ID 如何映射到上游模型，以及前缀、优先级和全局调度策略。",
+            font: .systemFont(ofSize: 11),
+            color: .secondaryLabelColor
+        ), to: root)
+
+        if let error = state.routingError {
+            addFullWidth(messageView(text: error), to: root)
+        }
+
+        if state.routingLoading && state.routingSnapshot == nil {
+            addFullWidth(placeholderCard(symbol: "arrow.triangle.branch", title: "正在读取路由", detail: "汇总 OAuth 别名、配置渠道与已注册模型…"), to: root)
+            return
+        }
+
+        guard let snapshot = state.routingSnapshot else {
+            addFullWidth(placeholderCard(symbol: "point.3.connected.trianglepath.dotted", title: "暂无路由数据", detail: "点击刷新重新读取管理配置。"), to: root)
+            return
+        }
+
+        addFullWidth(routingOverviewCard(snapshot), to: root)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.scrollerStyle = .overlay
+        scroll.automaticallyAdjustsContentInsets = false
+
+        let stack = TopAlignedStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 5, right: 0)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = stack
+        stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
+
+        for group in snapshot.providers {
+            let card = routingProviderCard(group)
+            stack.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        if snapshot.providers.isEmpty {
+            let empty = placeholderCard(symbol: "point.3.connected.trianglepath.dotted", title: "暂无渠道", detail: "服务未返回可路由的上游模型。")
+            stack.addArrangedSubview(empty)
+            empty.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        if !snapshot.failedSections.isEmpty {
+            let note = noteLabel(text: "部分配置读取失败：\(snapshot.failedSections.joined(separator: "、"))", color: .systemOrange)
+            stack.addArrangedSubview(note)
+            note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        let synced = label("同步于 \(relativeShort(snapshot.fetchedAt))", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor)
+        stack.addArrangedSubview(synced)
+
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 310).isActive = true
+        addFullWidth(scroll, to: root)
+    }
+
+    private func loadRoutingSnapshot() {
+        guard state.settings.isConfigured, !state.routingLoading else { return }
+        routingGeneration += 1
+        let generation = routingGeneration
+        state.routingLoading = true
+        state.routingError = nil
+        render()
+        let settings = state.settings
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let snapshot = try await CLIProxyAPIClient(settings: settings).fetchModelRoutingSnapshot()
+                guard generation == self.routingGeneration, self.state.screen == .routing else { return }
+                self.state.routingSnapshot = snapshot
+                self.state.routingLoading = false
+                self.render()
+            } catch {
+                guard generation == self.routingGeneration, self.state.screen == .routing else { return }
+                self.state.routingError = self.friendlyMessage(error)
+                self.state.routingLoading = false
+                self.render()
+            }
+        }
+    }
+
+    private func routingOverviewCard(_ snapshot: ModelRoutingSnapshot) -> NSView {
+        let card = cardView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 9
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -11)
+        ])
+
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 7
+        let icon = NSImageView(image: NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)) ?? NSImage())
+        icon.contentTintColor = .controlAccentColor
+        titleRow.addArrangedSubview(icon)
+        titleRow.addArrangedSubview(label("路由总览", font: .systemFont(ofSize: 12, weight: .semibold), color: .labelColor))
+        titleRow.addArrangedSubview(NSView())
+        titleRow.addArrangedSubview(pillLabel(routingStrategyText(snapshot.strategy), color: .controlAccentColor))
+        stack.addArrangedSubview(titleRow)
+        titleRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let metrics = NSStackView()
+        metrics.orientation = .horizontal
+        metrics.distribution = .fillEqually
+        metrics.alignment = .centerY
+        metrics.spacing = 0
+        metrics.addArrangedSubview(compactStatView(value: "\(snapshot.providers.count)", label: "渠道", color: .labelColor))
+        metrics.addArrangedSubview(compactStatView(value: "\(snapshot.accountCount)", label: "凭据", color: .labelColor))
+        metrics.addArrangedSubview(compactStatView(value: "\(snapshot.routeCount)", label: "路由定义", color: .systemBlue))
+        metrics.addArrangedSubview(compactStatView(
+            value: snapshot.forceModelPrefix ? "强制" : "兼容",
+            label: "模型前缀",
+            color: snapshot.forceModelPrefix ? .systemOrange : .systemGreen
+        ))
+        stack.addArrangedSubview(metrics)
+        metrics.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        return card
+    }
+
+    private func routingStrategyText(_ raw: String) -> String {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "fill-first": return "优先填充"
+        case "round-robin": return "轮询"
+        default: return raw.isEmpty ? "未知策略" : raw
+        }
+    }
+
+    private func routingProviderCard(_ group: ProviderRoutingGroup) -> NSView {
+        let card = cardView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -11)
+        ])
+
+        let accent = providerAccentColor(group.provider.accentName)
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        let badge = RoundedView(fill: accent.withAlphaComponent(0.14), border: accent.withAlphaComponent(0.12), radius: 7)
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        let icon = NSImageView(image: NSImage(systemSymbolName: group.provider.symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)) ?? NSImage())
+        icon.contentTintColor = accent
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(icon)
+        NSLayoutConstraint.activate([
+            badge.widthAnchor.constraint(equalToConstant: 24),
+            badge.heightAnchor.constraint(equalToConstant: 24),
+            icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor)
+        ])
+        header.addArrangedSubview(badge)
+        header.addArrangedSubview(label(group.provider.displayName, font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor))
+        header.addArrangedSubview(NSView())
+        header.addArrangedSubview(pillLabel("\(group.advertisedModelCount) 模型", color: .secondaryLabelColor))
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let metadata = NSStackView()
+        metadata.orientation = .horizontal
+        metadata.alignment = .centerY
+        metadata.spacing = 5
+        metadata.addArrangedSubview(pillLabel("\(group.accountCount) 凭据", color: .secondaryLabelColor))
+        if let priority = group.priorities.first {
+            metadata.addArrangedSubview(pillLabel("优先级 \(priority)", color: .systemIndigo))
+        }
+        if !group.prefixes.isEmpty {
+            metadata.addArrangedSubview(pillLabel("前缀 \(group.prefixes.joined(separator: ", "))", color: .systemPurple))
+        }
+        if group.officialAPIAccounts > 0 {
+            metadata.addArrangedSubview(pillLabel("官方 API ×\(group.officialAPIAccounts)", color: .systemGreen))
+        }
+        if !group.excludedModels.isEmpty {
+            metadata.addArrangedSubview(pillLabel("排除 \(group.excludedModels.count)", color: .systemOrange))
+        }
+        metadata.addArrangedSubview(NSView())
+        stack.addArrangedSubview(metadata)
+        metadata.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        if let baseURL = group.baseURLs.first {
+            let displayURL = safeEndpointDisplay(baseURL) ?? "已配置（地址已隐藏）"
+            let endpoint = label("Base URL · \(displayURL)", font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: .tertiaryLabelColor)
+            endpoint.lineBreakMode = .byTruncatingMiddle
+            endpoint.toolTip = displayURL
+            stack.addArrangedSubview(endpoint)
+            endpoint.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        if let proxyURL = group.proxyURLs.first {
+            let displayURL = safeEndpointDisplay(proxyURL) ?? "已配置（地址已隐藏）"
+            let extra = group.proxyURLs.count > 1 ? " · +\(group.proxyURLs.count - 1)" : ""
+            let proxy = label("代理 · \(displayURL)\(extra)", font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: .tertiaryLabelColor)
+            proxy.lineBreakMode = .byTruncatingMiddle
+            proxy.toolTip = ([displayURL] + Array(group.proxyURLs.dropFirst())).joined(separator: "\n")
+            stack.addArrangedSubview(proxy)
+            proxy.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        if let note = group.notes.first {
+            let extra = group.notes.count > 1 ? " · +\(group.notes.count - 1)" : ""
+            let noteView = label("备注 · \(note)\(extra)", font: .systemFont(ofSize: 9, weight: .regular), color: .tertiaryLabelColor)
+            noteView.lineBreakMode = .byTruncatingTail
+            noteView.toolTip = group.notes.joined(separator: "\n")
+            stack.addArrangedSubview(noteView)
+            noteView.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        let explicitRoutes = group.routes.filter {
+            $0.name.caseInsensitiveCompare($0.alias) != .orderedSame ||
+                $0.prefix != nil || $0.fork || $0.forceMapping
+        }
+        if explicitRoutes.isEmpty {
+            let note = noteLabel(text: "无显式别名映射；客户端模型以已注册模型列表为准。")
+            stack.addArrangedSubview(note)
+            note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            return card
+        }
+
+        let grouped = Dictionary(grouping: explicitRoutes) { $0.publicModelID.lowercased() }
+        let routeGroups = grouped.values.sorted { lhs, rhs in
+            (lhs.first?.publicModelID ?? "").localizedCaseInsensitiveCompare(rhs.first?.publicModelID ?? "") == .orderedAscending
+        }
+        for routes in routeGroups.prefix(10) {
+            let row = routingRouteRow(routes)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        if routeGroups.count > 10 {
+            stack.addArrangedSubview(noteLabel(text: "另有 \(routeGroups.count - 10) 个客户端模型映射"))
+        }
+        return card
+    }
+
+    private func routingRouteRow(_ routes: [ModelRouteDefinition]) -> NSView {
+        guard let first = routes.first else { return NSView() }
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 7
+
+        let alias = label(first.publicModelID, font: .monospacedSystemFont(ofSize: 10, weight: .semibold), color: .labelColor)
+        alias.lineBreakMode = .byTruncatingMiddle
+        alias.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(alias)
+
+        let arrow = NSImageView(image: NSImage(systemSymbolName: "arrow.left", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .medium)) ?? NSImage())
+        arrow.contentTintColor = .tertiaryLabelColor
+        row.addArrangedSubview(arrow)
+
+        let upstreamNames = routes.map(\.name)
+        let upstream = label(upstreamNames.joined(separator: " · "), font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: .secondaryLabelColor)
+        upstream.lineBreakMode = .byTruncatingMiddle
+        upstream.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(upstream)
+        row.addArrangedSubview(NSView())
+
+        if routes.count > 1 {
+            row.addArrangedSubview(pillLabel("路由池 ×\(routes.count)", color: .systemBlue))
+        } else if first.fork {
+            row.addArrangedSubview(pillLabel("保留原模型", color: .systemTeal))
+        } else if first.forceMapping {
+            row.addArrangedSubview(pillLabel("响应改写", color: .systemIndigo))
+        }
+        row.toolTip = "客户端 \(first.publicModelID) ← 上游 \(upstreamNames.joined(separator: ", "))"
+        return row
     }
 
     // MARK: - Services list
@@ -1017,6 +1336,11 @@ final class PopoverViewController: NSViewController {
         refresh.isEnabled = !state.isLoading
         row.addArrangedSubview(refresh)
 
+        let routing = circularIconButton(symbol: "arrow.triangle.branch", tooltip: "上游模型路由") { [weak self] in
+            self?.openRouting()
+        }
+        row.addArrangedSubview(routing)
+
         weak var manageRef: NSButton?
         let manage = circularIconButton(symbol: "ellipsis.circle", tooltip: "管理") { [weak self] in
             guard let self, let anchor = manageRef else { return }
@@ -1038,6 +1362,9 @@ final class PopoverViewController: NSViewController {
         })
         menu.addItem(CallbackMenuItem(title: "模型列表…") { [weak self] in
             self?.openModels()
+        })
+        menu.addItem(CallbackMenuItem(title: "上游模型路由…") { [weak self] in
+            self?.openRouting()
         })
         menu.addItem(.separator())
         menu.addItem(CallbackMenuItem(title: "管理服务…") { [weak self] in
@@ -1082,6 +1409,15 @@ final class PopoverViewController: NSViewController {
         loadModelPool()
     }
 
+    private func openRouting() {
+        state.screen = .routing
+        state.routingSnapshot = nil
+        state.routingError = nil
+        state.routingLoading = false
+        render()
+        loadRoutingSnapshot()
+    }
+
     /// The current-service title that doubles as the switcher: clicking it pops a menu of
     /// every service plus a "管理服务…" entry.
     private func serviceSwitcherButton() -> NSView {
@@ -1122,67 +1458,150 @@ final class PopoverViewController: NSViewController {
         menu.popUp(positioning: nil, at: location, in: view)
     }
 
-    private func summaryView(_ summary: PoolSummary) -> NSView {
+    private func overviewView(_ snapshot: PoolSnapshot) -> NSView {
         let card = cardView()
         let column = NSStackView()
         column.orientation = .vertical
         column.alignment = .leading
-        column.spacing = 8
+        column.spacing = 9
         column.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(column)
         NSLayoutConstraint.activate([
-            column.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
-            column.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
-            column.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            column.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            column.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            column.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
             column.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
         ])
 
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 0
-        row.alignment = .centerY
-        row.distribution = .fillEqually
-        row.translatesAutoresizingMaskIntoConstraints = false
-        column.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 8
+        titleRow.addArrangedSubview(label("账号与渠道健康", font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor))
+        titleRow.addArrangedSubview(NSView())
+        let overallHealth = snapshot.healthRatio
+        titleRow.addArrangedSubview(pillLabel(overallHealth.displayValue, color: healthColor(overallHealth)))
+        column.addArrangedSubview(titleRow)
+        titleRow.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
 
-        row.addArrangedSubview(statView(
-            value: displayPercent(summary.primaryAverage),
-            label: "Codex 5h",
-            color: summaryColor(summary.primaryAverage)
-        ))
-        row.addArrangedSubview(statView(
-            value: displayPercent(summary.weeklyAverage),
-            label: "Codex 7d",
-            color: summaryColor(summary.weeklyAverage)
-        ))
-        let accountText = (summary.quotaAccounts == summary.totalAccounts || summary.quotaAccounts == 0)
-            ? "\(summary.totalAccounts)"
-            : "\(summary.quotaAccounts)/\(summary.totalAccounts)"
-        row.addArrangedSubview(statView(
-            value: accountText,
-            label: summary.totalAccounts == 1 ? "Account" : "Accounts",
-            color: .labelColor
-        ))
+        let focusKeys: Set<String> = ["codex", "claude", "antigravity", "xai"]
+        let focusPools = snapshot.providers.filter { focusKeys.contains($0.provider.key) }
+        if !focusPools.isEmpty {
+            let grid = NSStackView()
+            grid.orientation = .vertical
+            grid.alignment = .leading
+            grid.spacing = 6
 
-        let caption = label(summaryCaption(summary), font: .systemFont(ofSize: 10), color: .tertiaryLabelColor)
-        caption.alignment = .center
-        caption.maximumNumberOfLines = 2
-        caption.lineBreakMode = .byWordWrapping
-        caption.preferredMaxLayoutWidth = popoverWidth - 64
-        column.addArrangedSubview(caption)
-        caption.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+            var tiles: [NSView] = []
+            for start in stride(from: 0, to: min(focusPools.count, 4), by: 2) {
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.alignment = .top
+                row.spacing = 6
+                row.distribution = .fillEqually
+
+                let end = min(start + 2, min(focusPools.count, 4))
+                for pool in focusPools[start..<end] {
+                    let tile = providerPulseView(pool)
+                    row.addArrangedSubview(tile)
+                    tiles.append(tile)
+                }
+                if end - start == 1 {
+                    let spacer = NSView()
+                    row.addArrangedSubview(spacer)
+                    if let tile = tiles.last {
+                        spacer.heightAnchor.constraint(equalTo: tile.heightAnchor).isActive = true
+                    }
+                }
+
+                grid.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
+            }
+            if let firstTile = tiles.first {
+                for tile in tiles.dropFirst() {
+                    tile.heightAnchor.constraint(equalTo: firstTile.heightAnchor).isActive = true
+                }
+            }
+
+            column.addArrangedSubview(grid)
+            grid.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        }
         return card
     }
 
-    private func summaryCaption(_ summary: PoolSummary) -> String {
-        // The 5h / 7d figures are Codex-only rolling windows; other providers report
-        // their own quota shapes (credits, balances, per-model limits) shown per card below.
-        if summary.codexAccounts == 0 {
-            return "5h · 7d 为 Codex 账号平均剩余额度（当前无 Codex 账号）；其他渠道额度见下方各自卡片。"
+    /// Small metric used by non-dashboard utility screens such as routing.
+    private func compactStatView(value: String, label labelText: String, color: NSColor) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 2
+        let valueLabel = label(value, font: .monospacedDigitSystemFont(ofSize: 17, weight: .semibold), color: color)
+        valueLabel.alignment = .center
+        stack.addArrangedSubview(valueLabel)
+        let desc = label(labelText, font: .systemFont(ofSize: 10, weight: .medium), color: .secondaryLabelColor)
+        desc.alignment = .center
+        stack.addArrangedSubview(desc)
+        return stack
+    }
+
+    private func providerPulseView(_ pool: ProviderPool) -> NSView {
+        let accent = providerAccentColor(pool.provider.accentName)
+        let tile = RoundedView(
+            fill: accent.withAlphaComponent(0.09),
+            border: accent.withAlphaComponent(0.14),
+            radius: 10
+        )
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        tile.addSubview(stack)
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 4
+        let icon = NSImageView(image: NSImage(systemSymbolName: pool.provider.symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)) ?? NSImage())
+        icon.contentTintColor = accent
+        header.addArrangedSubview(icon)
+        let name = label(pool.provider.displayName, font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor)
+        name.lineBreakMode = .byTruncatingTail
+        header.addArrangedSubview(name)
+        header.addArrangedSubview(NSView())
+
+        let health = pool.healthRatio
+        let value = label(
+            health.displayValue,
+            font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            color: healthColor(health)
+        )
+        value.alignment = .right
+        value.toolTip = "健康账号 / 凭据"
+        header.addArrangedSubview(value)
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        if let averages = providerQuotaSummaryView(pool) {
+            stack.addArrangedSubview(averages)
+            averages.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
-        let suffix = summary.codexAccounts == 1 ? "" : "，共 \(summary.codexAccounts) 个"
-        return "5h · 7d 为 Codex 账号平均剩余额度\(suffix)；其他渠道额度见下方各自卡片。"
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -8),
+            stack.topAnchor.constraint(equalTo: tile.topAnchor, constant: 7),
+            stack.bottomAnchor.constraint(equalTo: tile.bottomAnchor, constant: -7)
+        ])
+        return tile
+    }
+
+    private func healthColor(_ ratio: AccountHealthRatio) -> NSColor {
+        guard ratio.total > 0 else { return .tertiaryLabelColor }
+        if ratio.isFullyHealthy { return .systemGreen }
+        if ratio.healthy == 0 { return .systemRed }
+        return .systemOrange
     }
 
     private func statView(value: String, label labelText: String, color: NSColor) -> NSView {
@@ -1240,10 +1659,15 @@ final class PopoverViewController: NSViewController {
     }
 
     private func providerSection(_ pool: ProviderPool) -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
+        let section = TopAlignedStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 6
+        section.translatesAutoresizingMaskIntoConstraints = false
         let header = providerHeader(pool)
+        section.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: section.widthAnchor).isActive = true
+
         let cards = TopAlignedStackView()
         cards.orientation = .vertical
         cards.alignment = .leading
@@ -1255,19 +1679,9 @@ final class PopoverViewController: NSViewController {
             cards.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: cards.widthAnchor).isActive = true
         }
-
-        container.addSubview(header)
-        container.addSubview(cards)
-        NSLayoutConstraint.activate([
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            header.topAnchor.constraint(equalTo: container.topAnchor),
-            cards.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            cards.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            cards.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
-            cards.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-        return container
+        section.addArrangedSubview(cards)
+        cards.widthAnchor.constraint(equalTo: section.widthAnchor).isActive = true
+        return section
     }
 
     private func providerHeader(_ pool: ProviderPool) -> NSView {
@@ -1316,24 +1730,129 @@ final class PopoverViewController: NSViewController {
 
         row.addArrangedSubview(NSView())
 
+        let health = pool.healthRatio
+        let healthTint = healthColor(health)
         let countPill = RoundedView(
-            fill: NSColor.tertiaryLabelColor.withAlphaComponent(0.12),
+            fill: healthTint.withAlphaComponent(0.12),
             border: .clear,
             radius: 8
         )
-        let countLabel = label("\(pool.accounts.count)", font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor)
+        let countLabel = label(health.displayValue, font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: healthTint)
         countLabel.translatesAutoresizingMaskIntoConstraints = false
         countPill.addSubview(countLabel)
+        countPill.toolTip = "健康账号 / 凭据"
         NSLayoutConstraint.activate([
             countLabel.centerXAnchor.constraint(equalTo: countPill.centerXAnchor),
             countLabel.centerYAnchor.constraint(equalTo: countPill.centerYAnchor),
-            countPill.widthAnchor.constraint(greaterThanOrEqualToConstant: 22),
+            countPill.widthAnchor.constraint(greaterThanOrEqualToConstant: 34),
             countPill.heightAnchor.constraint(equalToConstant: 18),
             countLabel.leadingAnchor.constraint(equalTo: countPill.leadingAnchor, constant: 6),
             countLabel.trailingAnchor.constraint(equalTo: countPill.trailingAnchor, constant: -6)
         ])
         row.addArrangedSubview(countPill)
         return row
+    }
+
+    private func providerQuotaSummaryView(_ pool: ProviderPool) -> NSView? {
+        let averages = pool.quotaAverages
+        guard !averages.isEmpty else { return nil }
+
+        typealias MetricPair = (
+            title: String,
+            firstKind: ProviderQuotaMetricKind,
+            firstLabel: String,
+            secondKind: ProviderQuotaMetricKind,
+            secondLabel: String
+        )
+        let pairs: [MetricPair]
+        switch pool.provider.key {
+        case "codex":
+            pairs = [("池平均", .codexFiveHour, "5h", .codexSevenDay, "7d")]
+        case "claude":
+            pairs = [("池平均", .claudeFiveHour, "5h", .claudeSevenDay, "7d")]
+        case "antigravity":
+            pairs = [
+                ("Gemini", .antigravityGeminiFiveHour, "5h", .antigravityGeminiSevenDay, "7d"),
+                ("Claude/GPT", .antigravityClaudeGPTFiveHour, "5h", .antigravityClaudeGPTSevenDay, "7d")
+            ]
+        case "xai":
+            pairs = [("池平均", .xaiWeekly, "周", .xaiMonthly, "月")]
+        default:
+            return nil
+        }
+
+        let accent = providerAccentColor(pool.provider.accentName)
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for pair in pairs {
+            let first = averages.first { $0.kind == pair.firstKind }
+            let second = averages.first { $0.kind == pair.secondKind }
+            let tile = providerAverageTile(
+                title: pair.title,
+                firstLabel: pair.firstLabel,
+                first: first,
+                secondLabel: pair.secondLabel,
+                second: second,
+                accent: accent,
+                totalAccounts: pool.accounts.count
+            )
+            stack.addArrangedSubview(tile)
+            tile.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return stack
+    }
+
+    private func providerAverageTile(
+        title: String,
+        firstLabel: String,
+        first: ProviderQuotaAverage?,
+        secondLabel: String,
+        second: ProviderQuotaAverage?,
+        accent: NSColor,
+        totalAccounts: Int
+    ) -> NSView {
+        let tile = RoundedView(
+            fill: accent.withAlphaComponent(0.065),
+            border: accent.withAlphaComponent(0.11),
+            radius: 9
+        )
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .firstBaseline
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        tile.addSubview(stack)
+
+        let titleLabel = label(title, font: .systemFont(ofSize: 9, weight: .semibold), color: accent)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(NSView())
+        let firstValue = first?.remainingPercent.map(displayPercent) ?? "--"
+        let secondValue = second?.remainingPercent.map(displayPercent) ?? "--"
+        let value = label(
+            "\(firstLabel) \(firstValue)  ·  \(secondLabel) \(secondValue)",
+            font: .monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
+            color: .labelColor
+        )
+        value.alignment = .right
+        value.lineBreakMode = .byTruncatingTail
+        value.setContentHuggingPriority(.required, for: .horizontal)
+        stack.addArrangedSubview(value)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: 7),
+            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -7),
+            stack.topAnchor.constraint(equalTo: tile.topAnchor, constant: 4),
+            stack.bottomAnchor.constraint(equalTo: tile.bottomAnchor, constant: -4)
+        ])
+        let firstCount = first?.contributingAccounts ?? 0
+        let secondCount = second?.contributingAccounts ?? 0
+        tile.toolTip = "按账号等权平均剩余额度 · \(firstLabel) \(firstCount)/\(totalAccounts) · \(secondLabel) \(secondCount)/\(totalAccounts)"
+        return tile
     }
 
     private func providerAccentColor(_ name: String) -> NSColor {
@@ -1399,10 +1918,14 @@ final class PopoverViewController: NSViewController {
         } else if account.isUnavailable {
             stack.addArrangedSubview(noteLabel(text: "Unavailable"))
         } else if account.usage?.hasQuotaSignal == true {
-            for (labelText, window) in quotaRows(for: account.usage) {
+            let presentation = dashboardQuotaRows(for: account)
+            for (labelText, window) in presentation.rows {
                 let row = quotaLine(label: labelText, window: window)
                 stack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            if presentation.hiddenCount > 0 {
+                stack.addArrangedSubview(noteLabel(text: "另有 \(presentation.hiddenCount) 项额度，点击查看完整详情"))
             }
         } else {
             stack.addArrangedSubview(noteLabel(text: "No quota signal yet"))
@@ -1410,12 +1933,64 @@ final class PopoverViewController: NSViewController {
         return card
     }
 
+    private func dashboardQuotaRows(
+        for account: AccountQuota
+    ) -> (rows: [(String, QuotaWindow?)], hiddenCount: Int) {
+        let providerKey = ProviderCatalog.info(for: account.auth.normalizedProvider).key
+        if account.auth.isCodexLike {
+            let rows = quotaRows(for: account.usage)
+            return (Array(rows.prefix(3)), max(0, rows.count - 3))
+        }
+
+        let kinds: [ProviderQuotaMetricKind]
+        switch providerKey {
+        case "claude":
+            kinds = [.claudeFiveHour, .claudeSevenDay]
+        case "antigravity":
+            kinds = [
+                .antigravityGeminiFiveHour,
+                .antigravityGeminiSevenDay,
+                .antigravityClaudeGPTFiveHour,
+                .antigravityClaudeGPTSevenDay
+            ]
+        case "xai":
+            kinds = [.xaiWeekly, .xaiMonthly]
+        default:
+            let rows = quotaRows(for: account.usage)
+            return (Array(rows.prefix(3)), max(0, rows.count - 3))
+        }
+
+        let rows: [(String, QuotaWindow?)] = kinds.map { kind in
+            (kind.cardLabel, Optional(kind.averagedWindow(in: account) ?? missingQuotaWindow(for: kind)))
+        }
+        return (rows, 0)
+    }
+
+    private func missingQuotaWindow(for kind: ProviderQuotaMetricKind) -> QuotaWindow {
+        QuotaWindow(
+            id: "dashboard-missing-\(kind.rawValue)",
+            label: kind.cardLabel,
+            usedPercent: nil,
+            remainingPercent: nil,
+            resetAfterSeconds: nil,
+            resetAt: nil,
+            displayValue: "—",
+            amountText: nil,
+            detailText: nil,
+            isUsable: nil
+        )
+    }
+
     private func quotaRows(for usage: UsageSnapshot?) -> [(String, QuotaWindow?)] {
         guard let usage else { return [] }
         var rows: [(String, QuotaWindow?)] = []
         if usage.primary != nil || usage.weekly != nil {
-            rows.append(("5h", usage.primary))
-            rows.append(("7d", usage.weekly))
+            if let primary = usage.primary {
+                rows.append((primary.label, primary))
+            }
+            if let weekly = usage.weekly {
+                rows.append((weekly.label, weekly))
+            }
         }
         rows.append(contentsOf: usage.additionalWindows.map { ($0.label, Optional($0)) })
         return rows
@@ -1493,31 +2068,36 @@ final class PopoverViewController: NSViewController {
         meta.spacing = 8
         header.addArrangedSubview(meta)
 
-        let percent = label(window?.displayValue ?? displayPercent(window?.remainingPercent), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: .labelColor)
+        let displayValue = window?.displayValue.flatMap { $0 == "--" ? nil : $0 }
+            ?? window?.remainingPercent.map { displayPercent($0) }
+            ?? ""
+        let percent = label(displayValue, font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: .labelColor)
         percent.alignment = .right
-        percent.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        percent.setContentHuggingPriority(.required, for: .horizontal)
         meta.addArrangedSubview(percent)
 
         if let amountText = window?.amountText, !amountText.isEmpty {
             let amount = label(amountText, font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular), color: .secondaryLabelColor)
             amount.alignment = .right
             amount.lineBreakMode = .byTruncatingMiddle
-            amount.widthAnchor.constraint(equalToConstant: 92).isActive = true
+            amount.setContentHuggingPriority(.required, for: .horizontal)
             meta.addArrangedSubview(amount)
         }
 
         let reset = label(resetText(window), font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular), color: .tertiaryLabelColor)
         reset.alignment = .right
-        reset.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        reset.setContentHuggingPriority(.required, for: .horizontal)
         meta.addArrangedSubview(reset)
 
-        let bar = QuotaBarView()
-        bar.value = window?.remainingPercent ?? 0
-        bar.isMuted = window?.remainingPercent == nil
-        bar.isUnavailable = window?.isUsable == false
-        bar.heightAnchor.constraint(equalToConstant: 6).isActive = true
-        container.addArrangedSubview(bar)
-        bar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        if let remaining = window?.remainingPercent {
+            let bar = QuotaBarView()
+            bar.value = remaining
+            bar.isMuted = false
+            bar.isUnavailable = window?.isUsable == false
+            bar.heightAnchor.constraint(equalToConstant: 6).isActive = true
+            container.addArrangedSubview(bar)
+            bar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        }
         return container
     }
 
@@ -1689,8 +2269,25 @@ final class PopoverViewController: NSViewController {
             stack.addArrangedSubview(openLink)
         }
 
+        if let code = flow.userCode, !code.isEmpty {
+            let codeRow = NSStackView()
+            codeRow.orientation = .horizontal
+            codeRow.alignment = .centerY
+            codeRow.spacing = 8
+            codeRow.addArrangedSubview(label("设备代码", font: .systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor))
+            codeRow.addArrangedSubview(NSView())
+            let codeButton = CallbackButton(title: code) { [weak self] in
+                self?.copyToClipboard(code, notice: "已复制设备代码")
+            }
+            codeButton.bezelStyle = .accessoryBarAction
+            codeButton.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
+            codeRow.addArrangedSubview(codeButton)
+            stack.addArrangedSubview(codeRow)
+            codeRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
         // Redirect providers: the user pastes the redirected localhost URL back here.
-        if !flow.provider.usesDeviceFlow && flow.authURL != nil {
+        if !flow.usesDeviceFlow && flow.authURL != nil {
             stack.addArrangedSubview(label("② 登录后，把浏览器地址栏的回调链接粘贴到这里", font: .systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor))
 
             let pasteRow = NSStackView()
@@ -1793,15 +2390,25 @@ final class PopoverViewController: NSViewController {
             do {
                 let auth = try await client.requestOAuthURL(for: provider)
                 guard self.isCurrentOAuth(generation) else { return }
+                let usesDeviceFlow = auth.isDeviceFlow || provider.usesDeviceFlow
                 self.state.oauth?.authURL = auth.url
                 self.state.oauth?.sessionState = auth.state
-                // Keep the popover open while the user logs in (in any browser) and returns to paste.
+                self.state.oauth?.usesDeviceFlow = usesDeviceFlow
+                self.state.oauth?.userCode = auth.userCode
+                self.state.oauth?.expiresIn = auth.expiresIn
+                // Keep the popover open while the user completes authorization in any browser.
                 self.onHoldOpen?(true)
-                self.state.oauth?.phase = provider.usesDeviceFlow ? .authorizing : .waitingBrowser
+                self.state.oauth?.phase = usesDeviceFlow ? .authorizing : .waitingBrowser
                 self.render()
-                // Poll for completion: the device flow (Kimi) finishes on its own; redirect flows
+                // Poll for completion: device flows (Grok/xAI and Kimi) finish on their own; redirect flows
                 // finish once the user pastes the callback URL (see submitOAuthPaste).
-                try await self.pollOAuth(client: client, provider: provider, sessionState: auth.state, generation: generation)
+                try await self.pollOAuth(
+                    client: client,
+                    provider: provider,
+                    sessionState: auth.state,
+                    expiresIn: auth.expiresIn,
+                    generation: generation
+                )
             } catch {
                 guard self.isCurrentOAuth(generation), !(error is CancellationError) else { return }
                 self.failOAuth(error)
@@ -1813,7 +2420,7 @@ final class PopoverViewController: NSViewController {
     /// `startOAuth` detects completion, so this only needs to submit the callback.
     private func submitOAuthPaste(_ urlString: String) {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let flow = state.oauth, !flow.provider.usesDeviceFlow else { return }
+        guard let flow = state.oauth, !flow.usesDeviceFlow else { return }
         guard !trimmed.isEmpty else {
             state.oauth?.errorMessage = OAuthError.invalidCallback.errorDescription
             render()
@@ -1843,12 +2450,20 @@ final class PopoverViewController: NSViewController {
         }
     }
 
-    private func pollOAuth(client: CLIProxyAPIClient, provider: OAuthProvider, sessionState: String, generation: Int) async throws {
+    private func pollOAuth(
+        client: CLIProxyAPIClient,
+        provider: OAuthProvider,
+        sessionState: String,
+        expiresIn: Int?,
+        generation: Int
+    ) async throws {
         guard !sessionState.isEmpty else {
             succeedOAuth()
             return
         }
-        for _ in 0..<150 { // ~5 minutes at 2s cadence
+        let timeoutSeconds = max(300, min(expiresIn ?? (provider.usesDeviceFlow ? 1_800 : 300), 3_600))
+        let pollCount = max(1, timeoutSeconds / 2)
+        for _ in 0..<pollCount {
             try await Task.sleep(nanoseconds: 2_000_000_000)
             guard isCurrentOAuth(generation) else { return }
             let status = try await client.pollOAuthStatus(state: sessionState)
@@ -2253,7 +2868,7 @@ final class PopoverViewController: NSViewController {
         addFullWidth(header, to: root)
 
         addFullWidth(label(
-            "当前服务实际可用的模型，按渠道聚合；点击模型可复制 ID。",
+            "当前服务已注册并可路由的模型，按渠道聚合；点击模型可复制 ID。",
             font: .systemFont(ofSize: 11),
             color: .secondaryLabelColor
         ), to: root)
@@ -2465,6 +3080,11 @@ final class PopoverViewController: NSViewController {
             idLabel.lineBreakMode = .byTruncatingMiddle
             nameStack.addArrangedSubview(idLabel)
         }
+        if let capabilities = modelCapabilitySummary(entry.model) {
+            let capabilityLabel = label(capabilities, font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor)
+            capabilityLabel.lineBreakMode = .byTruncatingTail
+            nameStack.addArrangedSubview(capabilityLabel)
+        }
         nameStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(nameStack)
         row.addArrangedSubview(NSView())
@@ -2479,7 +3099,9 @@ final class PopoverViewController: NSViewController {
         copyIcon.contentTintColor = .tertiaryLabelColor
         row.addArrangedSubview(copyIcon)
 
-        clickable.toolTip = "点击复制模型 ID"
+        clickable.toolTip = [entry.model.description, "点击复制模型 ID"]
+            .compactMap { firstNonEmpty($0) }
+            .joined(separator: "\n")
         clickable.onClick = { [weak self] in
             self?.copyToClipboard(entry.model.id, notice: "已复制模型 ID")
         }
@@ -2841,6 +3463,10 @@ final class PopoverViewController: NSViewController {
             addRow("ChatGPT Account ID", detail?.chatgptAccountID ?? auth.accountID, copyable: true)
             addRow("Auth Index", auth.authIndex.isEmpty ? nil : auth.authIndex)
             addRow("计划", account.effectivePlanType?.capitalized)
+            addRow("模型前缀", auth.prefix)
+            if auth.isXAI, let usingAPI = auth.usingAPI {
+                addRow("Grok 路径", usingAPI ? "xAI 官方 API" : "Grok CLI Chat Proxy")
+            }
             if let date = detail?.subscriptionActiveStart {
                 addRow("订阅开始", absoluteTime(date))
             }
@@ -2857,11 +3483,16 @@ final class PopoverViewController: NSViewController {
             if let websockets = detail?.websockets {
                 addRow("WebSocket", websockets ? "启用" : "关闭")
             }
-            if let priority = detail?.priority {
+            if let priority = detail?.priority ?? auth.priority {
                 addRow("优先级", "\(priority)")
             }
-            // For config channels the synthesized note carries the channel's base-url.
-            addRow(account.configModels != nil ? "Base URL" : "备注", detail?.note)
+            addRow("出站代理", safeEndpointDisplay(auth.proxyURL))
+            if account.configModels != nil {
+                // For config channels the synthesized note carries the channel's base-url.
+                addRow("Base URL", safeEndpointDisplay(detail?.note ?? auth.note))
+            } else {
+                addRow("备注", detail?.note ?? auth.note)
+            }
             if let date = detail?.updatedAt {
                 addRow("更新时间", absoluteTime(date))
             }
@@ -3047,19 +3678,89 @@ final class PopoverViewController: NSViewController {
             idLabel.lineBreakMode = .byTruncatingMiddle
             nameStack.addArrangedSubview(idLabel)
         }
+        if let capabilities = modelCapabilitySummary(model) {
+            let capabilityLabel = label(capabilities, font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor)
+            capabilityLabel.lineBreakMode = .byTruncatingTail
+            nameStack.addArrangedSubview(capabilityLabel)
+        }
         nameStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(nameStack)
         row.addArrangedSubview(NSView())
         let runtime = modelRuntime(model, account: account)
         row.addArrangedSubview(pillLabel(runtime.title, color: runtime.color))
+        row.toolTip = model.description
         return row
+    }
+
+    private func modelCapabilitySummary(_ model: CPAModelDefinition) -> String? {
+        var parts: [String] = []
+        if let contextLength = model.contextLength, contextLength > 0 {
+            parts.append("\(compactTokenCount(contextLength)) 上下文")
+        }
+        if let outputLimit = model.maxCompletionTokens, outputLimit > 0 {
+            parts.append("\(compactTokenCount(outputLimit)) 输出")
+        }
+        if model.thinking != nil {
+            parts.append("思考")
+        }
+
+        let modalities = Set(
+            (model.supportedInputModalities + model.supportedOutputModalities)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        )
+        var media: [String] = []
+        if modalities.contains(where: { $0 == "image" || $0 == "images" || $0 == "vision" }) {
+            media.append("图像")
+        }
+        if modalities.contains(where: { $0 == "audio" || $0 == "speech" }) {
+            media.append("音频")
+        }
+        if modalities.contains("video") {
+            media.append("视频")
+        }
+        if model.supportsWebSearch == true {
+            media.append("Web")
+        }
+        if !media.isEmpty {
+            parts.append(media.joined(separator: "/"))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func compactTokenCount(_ value: Int) -> String {
+        if value > 0, value & (value - 1) == 0 {
+            if value >= 1_048_576 {
+                return "\(value / 1_048_576)M"
+            }
+            if value >= 1_024 {
+                return "\(value / 1_024)K"
+            }
+        }
+        let units: [(threshold: Double, suffix: String)] = [
+            (1_000_000, "M"),
+            (1_000, "K")
+        ]
+        let numericValue = Double(value)
+        for unit in units where numericValue >= unit.threshold {
+            let scaled = numericValue / unit.threshold
+            let rounded = scaled.rounded()
+            if abs(scaled - rounded) < 0.05 || scaled >= 10 {
+                return "\(Int(rounded))\(unit.suffix)"
+            }
+            return String(format: "%.1f%@", scaled, unit.suffix)
+                .replacingOccurrences(of: ".0", with: "")
+        }
+        return "\(value)"
     }
 
     private func modelRuntime(_ model: CPAModelDefinition, account: AccountQuota) -> (rank: Int, title: String, color: NSColor) {
         let keys = [model.id.lowercased(), (model.displayName ?? "").lowercased()].filter { !$0.isEmpty }
         let modelState = account.detail?.modelStates.first { keys.contains($0.key.lowercased()) }?.value
         guard let modelState else {
-            return (3, "可用", .systemGreen)
+            if account.configModels != nil {
+                return (3, "已配置", .systemBlue)
+            }
+            return (3, "已注册", .secondaryLabelColor)
         }
         let status = (modelState.status ?? "").lowercased()
         if status.contains("error") || status.contains("fail") || (modelState.lastErrorMessage ?? "").isEmpty == false {
@@ -3111,11 +3812,10 @@ final class PopoverViewController: NSViewController {
         return pill
     }
 
-    private func clickableCardView() -> ClickableCardView {
-        ClickableCardView(
-            fill: NSColor.controlBackgroundColor.withAlphaComponent(0.55),
-            border: NSColor.separatorColor.withAlphaComponent(0.18),
-            radius: 12
+    private func clickableCardView() -> ClickableGlassCardView {
+        ClickableGlassCardView(
+            tint: NSColor.controlAccentColor.withAlphaComponent(0.055),
+            radius: 15
         )
     }
 
@@ -3262,11 +3962,53 @@ final class PopoverViewController: NSViewController {
         return field
     }
 
-    private func cardView() -> RoundedView {
-        return RoundedView(
-            fill: NSColor.controlBackgroundColor.withAlphaComponent(0.55),
-            border: NSColor.separatorColor.withAlphaComponent(0.18),
-            radius: 12
+    /// Produces a display-only endpoint with credentials and request-specific
+    /// components removed. Invalid input is never echoed back to the UI.
+    private func safeEndpointDisplay(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let explicitScheme = trimmed.range(
+            of: #"^[A-Za-z][A-Za-z0-9+.-]*://"#,
+            options: .regularExpression
+        ) != nil
+        let schemeRelative = !explicitScheme && trimmed.hasPrefix("//")
+        let candidate: String
+        if explicitScheme {
+            candidate = trimmed
+        } else if schemeRelative {
+            candidate = "https:\(trimmed)"
+        } else {
+            candidate = "https://\(trimmed)"
+        }
+
+        guard var components = URLComponents(string: candidate),
+              let host = components.host,
+              !host.isEmpty
+        else {
+            return "已配置（地址已隐藏）"
+        }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        guard let sanitized = components.string else {
+            return "已配置（地址已隐藏）"
+        }
+        if explicitScheme {
+            return sanitized
+        }
+        if schemeRelative {
+            return String(sanitized.dropFirst("https:".count))
+        }
+        return String(sanitized.dropFirst("https://".count))
+    }
+
+    private func cardView() -> GlassCardView {
+        GlassCardView(
+            tint: NSColor.controlAccentColor.withAlphaComponent(0.045),
+            radius: 15
         )
     }
 
@@ -3430,20 +4172,146 @@ final class TopAlignedStackView: NSStackView {
     override var isFlipped: Bool { true }
 }
 
+final class AmbientGlowView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let gradient = NSGradient(colors: [
+            NSColor.controlAccentColor.withAlphaComponent(0.10),
+            NSColor.systemPurple.withAlphaComponent(0.055),
+            NSColor.clear
+        ])
+        gradient?.draw(in: bounds.insetBy(dx: -bounds.width * 0.15, dy: -bounds.height * 0.1), angle: -58)
+    }
+}
+
 class RoundedView: NSView {
+    private let fillColor: NSColor
+    private let borderColor: NSColor
+
     init(fill: NSColor, border: NSColor, radius: CGFloat = 10) {
+        self.fillColor = fill
+        self.borderColor = border
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = fill.cgColor
-        let isTransparentBorder = border.alphaComponent <= 0.001
-        layer?.borderColor = isTransparentBorder ? NSColor.clear.cgColor : border.cgColor
-        layer?.borderWidth = isTransparentBorder ? 0 : 0.5
         layer?.cornerRadius = radius
         layer?.cornerCurve = .continuous
+        updateColors()
+    }
+
+    required init?(coder: NSCoder) {
+        self.fillColor = .clear
+        self.borderColor = .clear
+        super.init(coder: coder)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColors()
+    }
+
+    private func updateColors() {
+        layer?.backgroundColor = fillColor.cgColor
+        let isTransparentBorder = borderColor.alphaComponent <= 0.001
+        layer?.borderColor = isTransparentBorder ? NSColor.clear.cgColor : borderColor.cgColor
+        layer?.borderWidth = isTransparentBorder ? 0 : 0.5
+    }
+}
+
+/// Native Liquid Glass on macOS 26, with a vibrancy fallback for macOS 13–15.
+/// Content is hosted inside the effect view so text and controls remain crisp.
+class GlassCardView: RoundedView {
+    private var contentHost: NSView?
+
+    init(tint: NSColor? = nil, radius: CGFloat = 15) {
+        super.init(fill: .clear, border: .clear, radius: radius)
+        wantsLayer = true
+        layer?.masksToBounds = false
+
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: .zero)
+            glass.translatesAutoresizingMaskIntoConstraints = false
+            glass.style = .regular
+            glass.cornerRadius = radius
+            glass.tintColor = tint
+            let host = NSView(frame: glass.bounds)
+            host.autoresizingMask = [.width, .height]
+            glass.contentView = host
+            super.addSubview(glass)
+            NSLayoutConstraint.activate([
+                glass.leadingAnchor.constraint(equalTo: leadingAnchor),
+                glass.trailingAnchor.constraint(equalTo: trailingAnchor),
+                glass.topAnchor.constraint(equalTo: topAnchor),
+                glass.bottomAnchor.constraint(equalTo: bottomAnchor)
+            ])
+            contentHost = host
+        } else {
+            let effect = NSVisualEffectView(frame: .zero)
+            effect.translatesAutoresizingMaskIntoConstraints = false
+            effect.material = .hudWindow
+            effect.blendingMode = .withinWindow
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.layer?.cornerRadius = radius
+            effect.layer?.cornerCurve = .continuous
+            effect.layer?.borderWidth = 0.5
+            effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+            super.addSubview(effect)
+
+            let host = NSView(frame: .zero)
+            host.translatesAutoresizingMaskIntoConstraints = false
+            super.addSubview(host)
+            NSLayoutConstraint.activate([
+                effect.leadingAnchor.constraint(equalTo: leadingAnchor),
+                effect.trailingAnchor.constraint(equalTo: trailingAnchor),
+                effect.topAnchor.constraint(equalTo: topAnchor),
+                effect.bottomAnchor.constraint(equalTo: bottomAnchor),
+                host.leadingAnchor.constraint(equalTo: leadingAnchor),
+                host.trailingAnchor.constraint(equalTo: trailingAnchor),
+                host.topAnchor.constraint(equalTo: topAnchor),
+                host.bottomAnchor.constraint(equalTo: bottomAnchor)
+            ])
+            contentHost = host
+        }
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+    }
+
+    override func addSubview(_ view: NSView) {
+        if let contentHost, view !== contentHost {
+            contentHost.addSubview(view)
+        } else {
+            super.addSubview(view)
+        }
+    }
+}
+
+final class ClickableGlassCardView: GlassCardView {
+    var onClick: (() -> Void)?
+
+    override init(tint: NSColor? = nil, radius: CGFloat = 15) {
+        super.init(tint: tint, radius: radius)
+        addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(handleClick)))
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    @objc private func handleClick() {
+        onClick?()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }
 

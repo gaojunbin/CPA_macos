@@ -3,13 +3,13 @@ import Foundation
 /// An OAuth-capable account provider exposed by the CLIProxyAPI management API.
 ///
 /// The management server drives the whole OAuth exchange (PKCE, token swap, persistence)
-/// server-side. A client only has to: request an auth URL, let the user log in via a browser,
-/// relay the `code`/`state` the provider redirects back with, and poll for completion.
+/// server-side. A client requests an auth URL and polls for completion. Redirect-based
+/// providers additionally relay the callback URL; device-flow providers need no callback.
 ///
 /// The flow here is fully manual: the app shows the authorization link to copy (the user may
 /// open it in any browser), and for redirect-based providers the user pastes the redirected
 /// `http://localhost:<port>/…` URL back into the app, which forwards it to the (possibly remote)
-/// management server. Kimi uses a device flow with no redirect, so it only needs polling.
+/// management server. Kimi and current xAI/Grok use device flows with no redirect, so they only need polling.
 /// `callbackPort` is kept to hint the expected localhost address in the paste field.
 public enum OAuthProvider: String, CaseIterable, Sendable {
     case codex
@@ -57,7 +57,7 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
         case .codex: return 1455          // http://localhost:1455/auth/callback
         case .claude: return 54545        // http://localhost:54545/callback
         case .antigravity: return 51121   // http://localhost:51121/oauth-callback
-        case .xai: return 56121           // http://127.0.0.1:56121/callback
+        case .xai: return nil             // RFC 8628 device flow in current CLIProxyAPI
         case .kimi: return nil            // device flow
         }
     }
@@ -70,7 +70,7 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
     public var catalogKey: String { rawValue }
 
     public var hint: String {
-        usesDeviceFlow ? "在浏览器中授权后自动完成" : "浏览器登录后自动回填"
+        usesDeviceFlow ? "在浏览器中授权后自动完成" : "浏览器登录后粘贴回调链接"
     }
 }
 
@@ -85,10 +85,26 @@ public enum OAuthStatus: Equatable, Sendable {
 public struct OAuthAuthURL: Sendable {
     public let url: String
     public let state: String
+    public let flow: String?
+    public let userCode: String?
+    public let expiresIn: Int?
 
-    public init(url: String, state: String) {
+    public init(
+        url: String,
+        state: String,
+        flow: String? = nil,
+        userCode: String? = nil,
+        expiresIn: Int? = nil
+    ) {
         self.url = url
         self.state = state
+        self.flow = flow
+        self.userCode = userCode
+        self.expiresIn = expiresIn
+    }
+
+    public var isDeviceFlow: Bool {
+        flow?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "device"
     }
 }
 

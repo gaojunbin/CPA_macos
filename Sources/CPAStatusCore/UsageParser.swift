@@ -12,6 +12,10 @@ public enum UsageParser {
             return parseGeneric(json, now: now)
         }
 
+        if let snapshot = parseAntigravityQuotaSummaryPayload(root, now: now) {
+            return snapshot
+        }
+
         if let snapshot = parseAntigravityModelsPayload(root, now: now) {
             return snapshot
         }
@@ -40,14 +44,18 @@ public enum UsageParser {
     }
 
     private static func parseWhamPayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
-        guard let rateLimit = firstDictionary(
+        let rateLimit = firstDictionary(
             root["rate_limit"],
             root["rateLimit"],
             findFirstDictionary(named: "rate_limit", in: root),
             findFirstDictionary(named: "rateLimit", in: root)
-        ) else {
-            return nil
-        }
+        )
+        let codeReviewRateLimit = firstDictionary(
+            root["code_review_rate_limit"],
+            root["codeReviewRateLimit"],
+            findFirstDictionary(named: "code_review_rate_limit", in: root),
+            findFirstDictionary(named: "codeReviewRateLimit", in: root)
+        )
 
         let planType = firstString(
             root["plan_type"],
@@ -55,13 +63,15 @@ public enum UsageParser {
             nested(root, "account_plan", "plan_type"),
             nested(root, "accountPlan", "planType")
         )
-        let limitReached = boolValue(firstValue(rateLimit["limit_reached"], rateLimit["limitReached"]))
-        let allowed = boolValue(firstValue(rateLimit["allowed"]))
+        let limitReached = boolValue(firstValue(rateLimit?["limit_reached"], rateLimit?["limitReached"]))
+        let allowed = boolValue(firstValue(rateLimit?["allowed"]))
         let exhaustedHint = limitReached == true || allowed == false
-        let primaryRaw = firstDictionary(rateLimit["primary_window"], rateLimit["primaryWindow"])
-        let secondaryRaw = firstDictionary(rateLimit["secondary_window"], rateLimit["secondaryWindow"])
+        let primaryRaw = firstDictionary(rateLimit?["primary_window"], rateLimit?["primaryWindow"])
+        let secondaryRaw = firstDictionary(rateLimit?["secondary_window"], rateLimit?["secondaryWindow"])
         let windows = pickPrimaryAndWeekly(primaryRaw, secondaryRaw, exhaustedHint: exhaustedHint, now: now)
-        let additional = parseAdditionalWindows(root, now: now)
+        var additional = parseCodeReviewWindows(codeReviewRateLimit, now: now)
+        additional.append(contentsOf: parseAdditionalWindows(root, now: now))
+        additional.append(contentsOf: buildCodexResetCreditsWindows(root, now: now))
         let status = firstString(root["status"], root["code"], nested(root, "error", "code"))
 
         let snapshot = UsageSnapshot(
@@ -85,6 +95,138 @@ public enum UsageParser {
         AntigravityModelGroup(id: "gemini-3-flash", label: "Gemini 3 Flash", identifiers: ["gemini-3-flash"]),
         AntigravityModelGroup(id: "gemini-image", label: "gemini-3.1-flash-image", identifiers: ["gemini-3.1-flash-image"], labelFromModel: true)
     ]
+
+    private static func parseAntigravityQuotaSummaryPayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
+        let provider = firstString(root["_provider"])?.lowercased()
+        let quota: [String: Any]
+        if firstArray(root["groups"]) != nil {
+            quota = root
+        } else if provider == "antigravity",
+                  let wrappedQuota = firstDictionary(root["quota"]),
+                  firstArray(wrappedQuota["groups"]) != nil {
+            quota = wrappedQuota
+        } else {
+            return nil
+        }
+
+        let groups = firstArray(quota["groups"]) ?? []
+        var windows = buildAntigravityQuotaSummaryWindows(groups, now: now)
+        let subscription = firstDictionary(root["subscription"])
+        if let paidTier = firstDictionary(subscription?["paidTier"], subscription?["paid_tier"]),
+           firstArray(paidTier["availableCredits"], paidTier["available_credits"]) != nil {
+            windows.append(buildAntigravityCreditsWindow(paidTier))
+        }
+        return UsageSnapshot(
+            planType: antigravitySubscriptionPlanType(subscription),
+            primary: nil,
+            weekly: nil,
+            additionalWindows: windows,
+            rawStatus: windows.isEmpty ? "empty_groups" : "groups_available",
+            fetchedAt: now
+        )
+    }
+
+    private static func buildAntigravityQuotaSummaryWindows(_ groups: [Any], now: Date) -> [QuotaWindow] {
+        var windows: [QuotaWindow] = []
+
+        for (groupIndex, rawGroup) in groups.enumerated() {
+            guard let group = rawGroup as? [String: Any] else {
+                continue
+            }
+            let groupLabel = firstString(
+                group["displayName"],
+                group["display_name"],
+                group["name"]
+            ) ?? "Quota Group \(groupIndex + 1)"
+            let buckets = firstArray(group["buckets"]) ?? []
+            let orderedBuckets = buckets.enumerated()
+                .compactMap { index, value -> (Int, [String: Any])? in
+                    guard let bucket = value as? [String: Any] else {
+                        return nil
+                    }
+                    return (index, bucket)
+                }
+                .sorted { lhs, rhs in
+                    let orderDifference = antigravityBucketOrder(lhs.1) - antigravityBucketOrder(rhs.1)
+                    if orderDifference != 0 {
+                        return orderDifference < 0
+                    }
+                    let lhsLabel = firstString(lhs.1["displayName"], lhs.1["display_name"], lhs.1["bucketId"], lhs.1["bucket_id"]) ?? ""
+                    let rhsLabel = firstString(rhs.1["displayName"], rhs.1["display_name"], rhs.1["bucketId"], rhs.1["bucket_id"]) ?? ""
+                    return lhsLabel.localizedCaseInsensitiveCompare(rhsLabel) == .orderedAscending
+                }
+
+            for (bucketIndex, bucket) in orderedBuckets {
+                guard let remainingFraction = fractionOrPercentFractionValue(firstValue(
+                          bucket["remainingFraction"],
+                          bucket["remaining_fraction"]
+                      ))
+                else {
+                    continue
+                }
+
+                let rawBucketID = firstString(bucket["bucketId"], bucket["bucket_id"])
+                    ?? "bucket-\(bucketIndex + 1)"
+                let bucketLabel = firstString(
+                    bucket["displayName"],
+                    bucket["display_name"]
+                ) ?? rawBucketID
+                let window = firstString(bucket["window"])
+                let rawResetTime = firstString(bucket["resetTime"], bucket["reset_time"])
+                let resetAt = rawResetTime.flatMap { dateValue($0, now: now) }
+                let normalizedFraction = clamp(remainingFraction, min: 0, max: 1)
+                let remainingPercent = normalizedFraction * 100
+                let groupID = stableIdentifier(groupLabel, fallback: "quota-group-\(groupIndex + 1)")
+                let bucketID = stableIdentifier(rawBucketID, fallback: "bucket-\(bucketIndex + 1)")
+                let detailParts = uniqueNonEmptyStrings([
+                    window,
+                    displayShortDate(resetAt) ?? rawResetTime
+                ])
+
+                windows.append(QuotaWindow(
+                    id: "antigravity-\(groupID)-\(bucketID)",
+                    label: "\(groupLabel) · \(bucketLabel)",
+                    usedPercent: clamp(100 - remainingPercent, min: 0, max: 100),
+                    remainingPercent: remainingPercent,
+                    resetAfterSeconds: nil,
+                    resetAt: resetAt,
+                    displayValue: displayPercent(remainingPercent),
+                    detailText: detailParts.isEmpty ? nil : detailParts.joined(separator: " · "),
+                    isUsable: remainingPercent > 0
+                ))
+            }
+        }
+
+        return windows
+    }
+
+    private static func antigravityBucketOrder(_ bucket: [String: Any]) -> Int {
+        switch firstString(bucket["window"])?.lowercased() {
+        case "5h", "five-hour", "five_hour":
+            return 0
+        case "weekly", "week":
+            return 1
+        default:
+            return 2
+        }
+    }
+
+    private static func antigravitySubscriptionPlanType(_ subscription: [String: Any]?) -> String? {
+        guard let subscription else {
+            return nil
+        }
+        let plan = firstString(subscription["plan"])
+        if let plan, plan.lowercased() != "unknown" {
+            return plan
+        }
+        return firstString(
+            subscription["tierName"],
+            subscription["tier_name"],
+            subscription["tierId"],
+            subscription["tier_id"],
+            plan
+        )
+    }
 
     private static func parseAntigravityModelsPayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
         guard let models = firstDictionary(root["models"], root["modelQuotas"], root["model_quotas"]) else {
@@ -518,36 +660,215 @@ public enum UsageParser {
     }
 
     private static func parseXAIPayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
-        guard let config = firstDictionary(root["config"]) else {
-            return nil
-        }
-        let monthlyLimit = centsValue(firstValue(config["monthlyLimit"], config["monthly_limit"]))
-        let used = centsValue(config["used"])
-        let onDemandCap = centsValue(firstValue(config["onDemandCap"], config["on_demand_cap"]))
-        let billingPeriodEnd = firstString(firstValue(config["billingPeriodEnd"], config["billing_period_end"]))
-        guard monthlyLimit != nil || used != nil || onDemandCap != nil || billingPeriodEnd != nil else {
+        let provider = firstString(root["_provider"])?.lowercased()
+        let weeklyConfig = xaiConfig(from: root["weekly"])
+        let monthlyConfig = xaiConfig(from: root["monthly"])
+        let legacyConfig = firstDictionary(root["config"])
+        let isWrappedPayload = provider == "xai" || provider == "x-ai" || provider == "grok"
+        guard legacyConfig != nil || weeklyConfig != nil || monthlyConfig != nil else {
             return nil
         }
 
         var windows: [QuotaWindow] = []
+        if let weeklyConfig {
+            windows.append(contentsOf: buildXAIWeeklyWindows(weeklyConfig, now: now))
+        }
+
+        if let monthlyConfig {
+            windows.append(contentsOf: buildXAIMonthlyWindows(
+                monthlyConfig,
+                now: now,
+                detailedPayAsYouGo: true
+            ))
+        }
+
+        if weeklyConfig == nil, monthlyConfig == nil, let legacyConfig {
+            if hasXAIWeeklyData(legacyConfig) {
+                windows.append(contentsOf: buildXAIWeeklyWindows(legacyConfig, now: now))
+            }
+            if hasXAIMonthlyData(legacyConfig) {
+                windows.append(contentsOf: buildXAIMonthlyWindows(
+                    legacyConfig,
+                    now: now,
+                    detailedPayAsYouGo: isWrappedPayload && firstValue(
+                        legacyConfig["onDemandUsed"],
+                        legacyConfig["on_demand_used"]
+                    ) != nil
+                ))
+            }
+        }
+
+        guard !windows.isEmpty else {
+            return nil
+        }
+
+        return UsageSnapshot(
+            planType: nil,
+            primary: nil,
+            weekly: nil,
+            additionalWindows: windows,
+            rawStatus: "billing_available",
+            fetchedAt: now
+        )
+    }
+
+    private static func xaiConfig(from value: Any?) -> [String: Any]? {
+        guard let container = firstDictionary(value) else {
+            return nil
+        }
+        return firstDictionary(container["config"]) ?? container
+    }
+
+    private static func hasXAIWeeklyData(_ config: [String: Any]) -> Bool {
+        if firstValue(config["creditUsagePercent"], config["credit_usage_percent"]) != nil {
+            return true
+        }
+        if let productUsage = firstArray(config["productUsage"], config["product_usage"]),
+           !productUsage.isEmpty {
+            return true
+        }
+        let period = firstDictionary(config["currentPeriod"], config["current_period"])
+        return firstString(period?["type"])?.lowercased().contains("weekly") == true
+    }
+
+    private static func hasXAIMonthlyData(_ config: [String: Any]) -> Bool {
+        firstValue(
+            config["monthlyLimit"],
+            config["monthly_limit"],
+            config["used"],
+            config["onDemandCap"],
+            config["on_demand_cap"],
+            config["onDemandUsed"],
+            config["on_demand_used"],
+            config["billingPeriodStart"],
+            config["billing_period_start"],
+            config["billingPeriodEnd"],
+            config["billing_period_end"]
+        ) != nil
+    }
+
+    private static func buildXAIWeeklyWindows(_ config: [String: Any], now: Date) -> [QuotaWindow] {
+        var windows: [QuotaWindow] = []
+        let period = firstDictionary(config["currentPeriod"], config["current_period"]) ?? [:]
+        let rawReset = firstString(
+            period["end"],
+            config["billingPeriodEnd"],
+            config["billing_period_end"]
+        )
+        let resetAt = rawReset.flatMap { dateValue($0, now: now) }
+        let rawWeeklyUsed = percentNumberValue(firstValue(
+            config["creditUsagePercent"],
+            config["credit_usage_percent"]
+        ))
+        let weeklyUsed = rawWeeklyUsed.map { clamp($0, min: 0, max: 100) }
+        let weeklyRemaining = weeklyUsed.map { clamp(100 - $0, min: 0, max: 100) }
+
+        if hasXAIWeeklyData(config) {
+            windows.append(QuotaWindow(
+                id: "xai-weekly-credits",
+                label: "周积分",
+                usedPercent: weeklyUsed,
+                remainingPercent: weeklyRemaining,
+                resetAfterSeconds: nil,
+                resetAt: resetAt,
+                displayValue: displayPercent(weeklyRemaining),
+                detailText: displayShortDate(resetAt) ?? rawReset,
+                isUsable: weeklyRemaining.map { $0 > 0 }
+            ))
+        }
+
+        let productUsage = firstArray(config["productUsage"], config["product_usage"]) ?? []
+        for (index, rawItem) in productUsage.enumerated() {
+            guard let item = rawItem as? [String: Any] else {
+                continue
+            }
+            let product = firstString(item["product"]) ?? "Product \(index + 1)"
+            let rawUsed = percentNumberValue(firstValue(item["usagePercent"], item["usage_percent"]))
+            let used = rawUsed.map { clamp($0, min: 0, max: 100) }
+            let remaining = used.map { clamp(100 - $0, min: 0, max: 100) }
+            windows.append(QuotaWindow(
+                id: "xai-product-\(stableIdentifier(product, fallback: "\(index + 1)"))",
+                label: "\(product) 使用",
+                usedPercent: used,
+                remainingPercent: remaining,
+                resetAfterSeconds: nil,
+                resetAt: resetAt,
+                displayValue: displayPercent(remaining),
+                detailText: displayShortDate(resetAt) ?? rawReset,
+                isUsable: remaining.map { $0 > 0 }
+            ))
+        }
+
+        return windows
+    }
+
+    private static func buildXAIMonthlyWindows(
+        _ config: [String: Any],
+        now: Date,
+        detailedPayAsYouGo: Bool
+    ) -> [QuotaWindow] {
+        let monthlyLimit = centsValue(firstValue(config["monthlyLimit"], config["monthly_limit"]))
+        let used = centsValue(config["used"])
+        let onDemandCap = centsValue(firstValue(config["onDemandCap"], config["on_demand_cap"]))
+        let explicitOnDemandUsed = centsValue(firstValue(config["onDemandUsed"], config["on_demand_used"]))
+        let derivedOnDemandUsed: Double? = {
+            guard let used, let monthlyLimit else {
+                return nil
+            }
+            return Swift.max(0, used - monthlyLimit)
+        }()
+        let onDemandUsed = explicitOnDemandUsed ?? (detailedPayAsYouGo ? derivedOnDemandUsed : nil)
+        let billingPeriodEnd = firstString(firstValue(config["billingPeriodEnd"], config["billing_period_end"]))
+        guard hasXAIMonthlyData(config) else {
+            return []
+        }
+
+        var windows: [QuotaWindow] = []
         let payAsYouGoEnabled = (onDemandCap ?? 0) > 0
+        let payAsYouGoUsedPercent: Double?
+        let payAsYouGoRemainingPercent: Double?
+        if let onDemandCap, onDemandCap > 0, let onDemandUsed {
+            payAsYouGoUsedPercent = clamp((onDemandUsed / onDemandCap) * 100, min: 0, max: 100)
+            payAsYouGoRemainingPercent = clamp(100 - (payAsYouGoUsedPercent ?? 0), min: 0, max: 100)
+        } else {
+            payAsYouGoUsedPercent = nil
+            payAsYouGoRemainingPercent = nil
+        }
+        let payAsYouGoAmount: String?
+        if payAsYouGoEnabled, detailedPayAsYouGo, let onDemandUsed {
+            payAsYouGoAmount = "已用 \(displayCurrency(cents: onDemandUsed)) / 封顶 \(displayCurrency(cents: onDemandCap))"
+        } else if payAsYouGoEnabled {
+            payAsYouGoAmount = "封顶 \(displayCurrency(cents: onDemandCap))"
+        } else {
+            payAsYouGoAmount = nil
+        }
         windows.append(QuotaWindow(
             id: "xai-pay-as-you-go",
             label: "按量付费",
-            usedPercent: nil,
-            remainingPercent: nil,
+            usedPercent: payAsYouGoUsedPercent,
+            remainingPercent: payAsYouGoRemainingPercent,
             resetAfterSeconds: nil,
             resetAt: nil,
-            displayValue: payAsYouGoEnabled ? "已启用" : "未启用",
-            amountText: payAsYouGoEnabled ? "封顶 \(displayCurrency(cents: onDemandCap))" : nil,
+            displayValue: payAsYouGoRemainingPercent.map { displayPercent($0) }
+                ?? (payAsYouGoEnabled ? "已启用" : "未启用"),
+            amountText: payAsYouGoAmount,
             detailText: nil,
             isUsable: nil
         ))
 
+        let includedUsed: Double? = {
+            guard let used else {
+                return nil
+            }
+            if let monthlyLimit, monthlyLimit > 0 {
+                return Swift.min(used, monthlyLimit)
+            }
+            return used
+        }()
         let usedPercent: Double?
         let remainingPercent: Double?
-        if let monthlyLimit, monthlyLimit > 0, let used {
-            usedPercent = clamp((used / monthlyLimit) * 100, min: 0, max: 100)
+        if let monthlyLimit, monthlyLimit > 0, let includedUsed {
+            usedPercent = clamp((includedUsed / monthlyLimit) * 100, min: 0, max: 100)
             remainingPercent = clamp(100 - (usedPercent ?? 0), min: 0, max: 100)
         } else {
             usedPercent = nil
@@ -562,19 +883,12 @@ public enum UsageParser {
             resetAfterSeconds: nil,
             resetAt: resetAt,
             displayValue: displayPercent(remainingPercent),
-            amountText: xaiAmount(usedCents: used, limitCents: monthlyLimit),
-            detailText: displayShortDate(resetAt),
+            amountText: xaiAmount(usedCents: includedUsed, limitCents: monthlyLimit),
+            detailText: displayShortDate(resetAt) ?? billingPeriodEnd,
             isUsable: remainingPercent.map { $0 > 0 }
         ))
 
-        return UsageSnapshot(
-            planType: nil,
-            primary: nil,
-            weekly: nil,
-            additionalWindows: windows,
-            rawStatus: "billing_available",
-            fetchedAt: now
-        )
+        return windows
     }
 
     private static func centsValue(_ value: Any?) -> Double? {
@@ -604,30 +918,170 @@ public enum UsageParser {
         exhaustedHint: Bool,
         now: Date
     ) -> (primary: QuotaWindow?, weekly: QuotaWindow?) {
-        let candidates = [first, second].compactMap { $0 }
-        var fiveHour: [String: Any]?
-        var weekly: [String: Any]?
+        let classified = classifyCodexWindows(first, second)
+        let secondaryIsMonthly = isCodexMonthlyWindow(classified.secondary)
 
-        for candidate in candidates {
-            let duration = numberValue(firstValue(candidate["limit_window_seconds"], candidate["limitWindowSeconds"]))
+        return (
+            primary: buildWindow(
+                id: "code-5h",
+                label: "5h",
+                raw: classified.fiveHour,
+                exhaustedHint: exhaustedHint,
+                now: now
+            ),
+            weekly: buildWindow(
+                id: secondaryIsMonthly ? "code-monthly" : "code-7d",
+                label: secondaryIsMonthly ? "月度限额" : "7d",
+                raw: classified.secondary,
+                exhaustedHint: exhaustedHint,
+                now: now
+            )
+        )
+    }
+
+    private static func classifyCodexWindows(
+        _ first: [String: Any]?,
+        _ second: [String: Any]?
+    ) -> (fiveHour: [String: Any]?, secondary: [String: Any]?) {
+        let candidates = [(0, first), (1, second)].compactMap { index, value in
+            value.map { (index, $0) }
+        }
+        var fiveHour: [String: Any]?
+        var secondary: [String: Any]?
+        var fiveHourIndex: Int?
+        var secondaryIndex: Int?
+
+        for (index, candidate) in candidates {
+            let duration = codexWindowDuration(candidate)
             if duration == 18_000, fiveHour == nil {
                 fiveHour = candidate
-            } else if duration == 604_800, weekly == nil {
-                weekly = candidate
+                fiveHourIndex = index
+            } else if (duration == 604_800 || isCodexMonthlyWindow(candidate)), secondary == nil {
+                secondary = candidate
+                secondaryIndex = index
             }
         }
 
-        if fiveHour == nil {
+        if fiveHour == nil, let first, secondaryIndex != 0 {
             fiveHour = first
+            fiveHourIndex = 0
         }
-        if weekly == nil {
-            weekly = second
+        if secondary == nil, let second, fiveHourIndex != 1 {
+            secondary = second
+            secondaryIndex = 1
         }
 
-        return (
-            primary: buildWindow(id: "code-5h", label: "5h", raw: fiveHour, exhaustedHint: exhaustedHint, now: now),
-            weekly: buildWindow(id: "code-7d", label: "7d", raw: weekly, exhaustedHint: exhaustedHint, now: now)
+        return (fiveHour, secondary)
+    }
+
+    private static func codexWindowDuration(_ window: [String: Any]?) -> Double? {
+        guard let window else {
+            return nil
+        }
+        return numberValue(firstValue(window["limit_window_seconds"], window["limitWindowSeconds"]))
+    }
+
+    private static func isCodexMonthlyWindow(_ window: [String: Any]?) -> Bool {
+        guard let duration = codexWindowDuration(window) else {
+            return false
+        }
+        let day = 24.0 * 60 * 60
+        return duration >= 28 * day && duration <= 31 * day
+    }
+
+    private static func parseCodeReviewWindows(_ rateLimit: [String: Any]?, now: Date) -> [QuotaWindow] {
+        guard let rateLimit else {
+            return []
+        }
+        let limitReached = boolValue(firstValue(rateLimit["limit_reached"], rateLimit["limitReached"]))
+        let allowed = boolValue(rateLimit["allowed"])
+        let exhaustedHint = limitReached == true || allowed == false
+        let classified = classifyCodexWindows(
+            firstDictionary(rateLimit["primary_window"], rateLimit["primaryWindow"]),
+            firstDictionary(rateLimit["secondary_window"], rateLimit["secondaryWindow"])
         )
+        var result: [QuotaWindow] = []
+
+        if let primary = buildWindow(
+            id: "code-review-5h",
+            label: "代码审查 5h",
+            raw: classified.fiveHour,
+            exhaustedHint: exhaustedHint,
+            now: now
+        ) {
+            result.append(primary)
+        }
+        let secondaryIsMonthly = isCodexMonthlyWindow(classified.secondary)
+        if let secondary = buildWindow(
+            id: secondaryIsMonthly ? "code-review-monthly" : "code-review-7d",
+            label: secondaryIsMonthly ? "代码审查月度限额" : "代码审查周限额",
+            raw: classified.secondary,
+            exhaustedHint: exhaustedHint,
+            now: now
+        ) {
+            result.append(secondary)
+        }
+        return result
+    }
+
+    private static func buildCodexResetCreditsWindows(_ root: [String: Any], now: Date) -> [QuotaWindow] {
+        guard let resetCredits = firstDictionary(
+            root["rate_limit_reset_credits"],
+            root["rateLimitResetCredits"],
+            findFirstDictionary(named: "rate_limit_reset_credits", in: root),
+            findFirstDictionary(named: "rateLimitResetCredits", in: root)
+        ) else {
+            return []
+        }
+
+        var windows: [QuotaWindow] = []
+        if let availableCount = numberValue(firstValue(
+            resetCredits["available_count"],
+            resetCredits["availableCount"]
+        )) {
+            windows.append(QuotaWindow(
+                id: "code-reset-credits",
+                label: "主动重置次数",
+                usedPercent: nil,
+                remainingPercent: nil,
+                resetAfterSeconds: nil,
+                resetAt: nil,
+                displayValue: displayCount(availableCount),
+                amountText: nil,
+                detailText: nil,
+                isUsable: nil
+            ))
+        }
+
+        let credits = firstArray(resetCredits["credits"]) ?? []
+        var availableIndex = 0
+        for (sourceIndex, rawCredit) in credits.enumerated() {
+            guard let credit = rawCredit as? [String: Any],
+                  firstString(credit["status"])?.lowercased() == "available",
+                  firstString(credit["reset_type"], credit["resetType"])?.lowercased() == "codex_rate_limits",
+                  let rawExpiresAt = firstString(credit["expires_at"], credit["expiresAt"])
+            else {
+                continue
+            }
+
+            availableIndex += 1
+            let resetAt = dateValue(rawExpiresAt, now: now)
+            let rawID = firstString(credit["id"]) ?? "\(sourceIndex + 1)"
+            windows.append(QuotaWindow(
+                id: "code-reset-credit-\(stableIdentifier(rawID, fallback: "\(sourceIndex + 1)"))",
+                label: "主动重置券 #\(availableIndex)",
+                usedPercent: nil,
+                remainingPercent: nil,
+                resetAfterSeconds: nil,
+                resetAt: resetAt,
+                displayValue: "可用",
+                amountText: nil,
+                detailText: "到期 \(displayShortDate(resetAt) ?? rawExpiresAt)",
+                isUsable: nil
+            ))
+        }
+
+        return windows
     }
 
     private static func parseAdditionalWindows(_ root: [String: Any], now: Date) -> [QuotaWindow] {
@@ -654,10 +1108,12 @@ public enum UsageParser {
             ) {
                 result.append(primary)
             }
+            let secondaryRaw = firstDictionary(rateLimit["secondary_window"], rateLimit["secondaryWindow"])
+            let secondaryIsMonthly = isCodexMonthlyWindow(secondaryRaw)
             if let weekly = buildWindow(
-                id: "\(name)-7d",
-                label: "\(name) 7d",
-                raw: firstDictionary(rateLimit["secondary_window"], rateLimit["secondaryWindow"]),
+                id: "\(name)-\(secondaryIsMonthly ? "monthly" : "7d")",
+                label: secondaryIsMonthly ? "\(name) 月度限额" : "\(name) 7d",
+                raw: secondaryRaw,
                 exhaustedHint: exhaustedHint,
                 now: now
             ) {
@@ -823,6 +1279,39 @@ public enum UsageParser {
         return components.contains { component in
             component == normalizedKey || component.replacingOccurrences(of: "_", with: "") == normalizedKey
         }
+    }
+
+    private static func stableIdentifier(_ value: String, fallback: String) -> String {
+        let mapped = value.lowercased().map { character -> Character in
+            character.isLetter || character.isNumber ? character : "-"
+        }
+        let identifier = String(mapped)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return identifier.isEmpty ? fallback : identifier
+    }
+
+    private static func uniqueNonEmptyStrings(_ values: [String?]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else {
+                continue
+            }
+            result.append(trimmed)
+        }
+        return result
+    }
+
+    private static func displayCount(_ value: Double) -> String {
+        let rounded = value.rounded()
+        if abs(value - rounded) < 0.000_001 {
+            return String(Int(rounded))
+        }
+        return String(format: "%.2f", value)
+            .replacingOccurrences(of: #"0+$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\.$"#, with: "", options: .regularExpression)
     }
 }
 

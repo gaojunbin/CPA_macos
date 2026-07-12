@@ -37,6 +37,11 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
     public let accountID: String?
     public let planType: String?
     public let projectID: String?
+    public let prefix: String?
+    public let priority: Int?
+    public let usingAPI: Bool?
+    public let proxyURL: String?
+    public let note: String?
     public let status: String?
     public let statusMessage: String?
     public let disabled: Bool
@@ -51,7 +56,11 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
     }
 
     public var isCodexLike: Bool {
-        normalizedProvider == "codex" || normalizedProvider.contains("openai")
+        let provider = normalizedProvider
+        guard !provider.hasPrefix("openai-compatible"), provider != "openai-compatibility" else {
+            return false
+        }
+        return provider == "codex" || provider.contains("openai")
     }
 
     public var isAntigravity: Bool {
@@ -84,6 +93,11 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         accountID: String? = nil,
         planType: String? = nil,
         projectID: String? = nil,
+        prefix: String? = nil,
+        priority: Int? = nil,
+        usingAPI: Bool? = nil,
+        proxyURL: String? = nil,
+        note: String? = nil,
         status: String? = nil,
         statusMessage: String? = nil,
         disabled: Bool = false,
@@ -100,6 +114,11 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         self.accountID = accountID
         self.planType = planType
         self.projectID = projectID
+        self.prefix = prefix
+        self.priority = priority
+        self.usingAPI = usingAPI
+        self.proxyURL = proxyURL
+        self.note = note
         self.status = status
         self.statusMessage = statusMessage
         self.disabled = disabled
@@ -122,6 +141,13 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         case plan
         case projectID = "project_id"
         case projectIDCamel = "projectId"
+        case prefix
+        case priority
+        case usingAPI = "using_api"
+        case usingAPICamel = "usingApi"
+        case proxyURL = "proxy_url"
+        case proxyURLCamel = "proxyUrl"
+        case note
         case status
         case statusMessage = "status_message"
         case disabled
@@ -162,6 +188,14 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
             container.lossyString(forKey: .projectID),
             container.lossyString(forKey: .projectIDCamel)
         )
+        self.prefix = container.lossyString(forKey: .prefix)
+        self.priority = container.lossyInt(forKey: .priority)
+        self.usingAPI = container.lossyBool(forKey: .usingAPI) ?? container.lossyBool(forKey: .usingAPICamel)
+        self.proxyURL = firstNonEmpty(
+            container.lossyString(forKey: .proxyURL),
+            container.lossyString(forKey: .proxyURLCamel)
+        )
+        self.note = container.lossyString(forKey: .note)
         self.status = container.lossyString(forKey: .status)
         self.statusMessage = container.lossyString(forKey: .statusMessage)
         self.disabled = container.lossyBool(forKey: .disabled) ?? false
@@ -497,26 +531,148 @@ public struct ModelsResponse: Decodable, Sendable {
     public let models: [CPAModelDefinition]
 }
 
+/// One truthful upstream-to-client model mapping used by the routing UI.
+/// `name` is the upstream ID sent to the provider, while `alias` is the
+/// client-facing ID before an optional credential/channel prefix is applied.
+public struct ModelRouteDefinition: Identifiable, Equatable, Sendable {
+    public let name: String
+    public let alias: String
+    public let prefix: String?
+    public let source: String
+    public let fork: Bool
+    public let forceMapping: Bool
+    /// Explicit client-facing ID after the global prefix policy has been applied.
+    /// Canonical config/OAuth mappings leave this nil; the routing resolver expands
+    /// them into one or two concrete public IDs before the UI consumes them.
+    private let explicitPublicModelID: String?
+
+    public init(
+        name: String,
+        alias: String,
+        prefix: String? = nil,
+        source: String,
+        fork: Bool = false,
+        forceMapping: Bool = false,
+        publicModelID: String? = nil
+    ) {
+        self.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.alias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.prefix = firstNonEmpty(prefix)
+        self.source = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.fork = fork
+        self.forceMapping = forceMapping
+        self.explicitPublicModelID = firstNonEmpty(publicModelID)
+    }
+
+    /// Explicit names for consumers that should not depend on the wire-format
+    /// terminology used by config.yaml (`name` / `alias`).
+    public var upstreamModelName: String { name }
+    public var clientFacingAlias: String { alias }
+
+    /// The concrete public ID exposed by this resolved route. Canonical mappings
+    /// fall back to their prefixed form until `ModelRoutingResolver` expands the
+    /// global force-prefix policy into explicit client IDs.
+    public var publicModelID: String {
+        if let explicitPublicModelID {
+            return explicitPublicModelID
+        }
+        guard let prefix else { return alias }
+        return "\(prefix)/\(alias)"
+    }
+
+    /// Returns a copy bound to one concrete client-facing model ID. Keeping the
+    /// configured prefix on the copy lets the UI explain where the variant came
+    /// from while `publicModelID` remains the authoritative resolved value.
+    public func resolvingPublicModelID(_ id: String) -> ModelRouteDefinition {
+        ModelRouteDefinition(
+            name: name,
+            alias: alias,
+            prefix: prefix,
+            source: source,
+            fork: fork,
+            forceMapping: forceMapping,
+            publicModelID: id
+        )
+    }
+
+    /// Stable identity includes both ends of the mapping and its routing flags,
+    /// so repeated aliases that target different upstream models remain distinct.
+    public var id: String {
+        [source, prefix ?? "", name, alias, publicModelID, fork ? "1" : "0", forceMapping ? "1" : "0"]
+            .map { "\($0.utf8.count):\($0)" }
+            .joined(separator: "|")
+    }
+}
+
 public struct CPAModelDefinition: Decodable, Identifiable, Equatable, Sendable {
     public let id: String
     public let displayName: String?
     public let type: String?
     public let ownedBy: String?
+    public let description: String?
+    public let contextLength: Int?
+    public let maxCompletionTokens: Int?
+    public let supportedInputModalities: [String]
+    public let supportedOutputModalities: [String]
+    public let supportsWebSearch: Bool?
+    public let thinking: ModelThinkingCapabilities?
 
-    public init(id: String, displayName: String? = nil, type: String? = nil, ownedBy: String? = nil) {
+    public init(
+        id: String,
+        displayName: String? = nil,
+        type: String? = nil,
+        ownedBy: String? = nil,
+        description: String? = nil,
+        contextLength: Int? = nil,
+        maxCompletionTokens: Int? = nil,
+        supportedInputModalities: [String] = [],
+        supportedOutputModalities: [String] = [],
+        supportsWebSearch: Bool? = nil,
+        thinking: ModelThinkingCapabilities? = nil
+    ) {
         self.id = id
         self.displayName = displayName
         self.type = type
         self.ownedBy = ownedBy
+        self.description = description
+        self.contextLength = contextLength
+        self.maxCompletionTokens = maxCompletionTokens
+        self.supportedInputModalities = supportedInputModalities
+        self.supportedOutputModalities = supportedOutputModalities
+        self.supportsWebSearch = supportsWebSearch
+        self.thinking = thinking
     }
+
+    public var inputTokenLimit: Int? { contextLength }
+    public var outputTokenLimit: Int? { maxCompletionTokens }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case type
+        case description
         case displayName = "display_name"
         case displayNameCamel = "displayName"
         case ownedBy = "owned_by"
         case ownedByCamel = "ownedBy"
+        case contextLength = "context_length"
+        case contextLengthCamel = "contextLength"
+        case inputTokenLimit = "input_token_limit"
+        case inputTokenLimitCamel = "inputTokenLimit"
+        case maxCompletionTokens = "max_completion_tokens"
+        case maxCompletionTokensCamel = "maxCompletionTokens"
+        case outputTokenLimit = "output_token_limit"
+        case outputTokenLimitCamel = "outputTokenLimit"
+        case supportedInputModalities = "supported_input_modalities"
+        case supportedInputModalitiesCamel = "supportedInputModalities"
+        case inputModalities = "input_modalities"
+        case inputModalitiesCamel = "inputModalities"
+        case supportedOutputModalities = "supported_output_modalities"
+        case supportedOutputModalitiesCamel = "supportedOutputModalities"
+        case outputModalities = "output_modalities"
+        case outputModalitiesCamel = "outputModalities"
+        case supportsWebSearch = "supports_web_search"
+        case supportsWebSearchCamel = "supportsWebSearch"
+        case thinking
     }
 
     public init(from decoder: Decoder) throws {
@@ -531,6 +687,99 @@ public struct CPAModelDefinition: Decodable, Identifiable, Equatable, Sendable {
             container.lossyString(forKey: .ownedBy),
             container.lossyString(forKey: .ownedByCamel)
         )
+        description = container.lossyString(forKey: .description)
+        contextLength = container.lossyInt(forKey: .contextLength)
+            ?? container.lossyInt(forKey: .contextLengthCamel)
+            ?? container.lossyInt(forKey: .inputTokenLimit)
+            ?? container.lossyInt(forKey: .inputTokenLimitCamel)
+        maxCompletionTokens = container.lossyInt(forKey: .maxCompletionTokens)
+            ?? container.lossyInt(forKey: .maxCompletionTokensCamel)
+            ?? container.lossyInt(forKey: .outputTokenLimit)
+            ?? container.lossyInt(forKey: .outputTokenLimitCamel)
+        supportedInputModalities = firstNonEmptyArray(
+            container.lossyStringArray(forKey: .supportedInputModalities),
+            container.lossyStringArray(forKey: .supportedInputModalitiesCamel),
+            container.lossyStringArray(forKey: .inputModalities),
+            container.lossyStringArray(forKey: .inputModalitiesCamel)
+        )
+        supportedOutputModalities = firstNonEmptyArray(
+            container.lossyStringArray(forKey: .supportedOutputModalities),
+            container.lossyStringArray(forKey: .supportedOutputModalitiesCamel),
+            container.lossyStringArray(forKey: .outputModalities),
+            container.lossyStringArray(forKey: .outputModalitiesCamel)
+        )
+        supportsWebSearch = container.lossyBool(forKey: .supportsWebSearch)
+            ?? container.lossyBool(forKey: .supportsWebSearchCamel)
+        thinking = try? container.decodeIfPresent(ModelThinkingCapabilities.self, forKey: .thinking)
+    }
+}
+
+public struct ModelThinkingCapabilities: Decodable, Equatable, Sendable {
+    public let min: Int?
+    public let max: Int?
+    public let zeroAllowed: Bool?
+    public let dynamicAllowed: Bool?
+    public let levels: [String]
+
+    public init(
+        min: Int? = nil,
+        max: Int? = nil,
+        zeroAllowed: Bool? = nil,
+        dynamicAllowed: Bool? = nil,
+        levels: [String] = []
+    ) {
+        self.min = min
+        self.max = max
+        self.zeroAllowed = zeroAllowed
+        self.dynamicAllowed = dynamicAllowed
+        self.levels = levels
+    }
+
+    public var minimumTokens: Int? { min }
+    public var maximumTokens: Int? { max }
+
+    fileprivate func mergingMissingMetadata(from other: ModelThinkingCapabilities?) -> ModelThinkingCapabilities {
+        guard let other else { return self }
+        return ModelThinkingCapabilities(
+            min: min ?? other.min,
+            max: max ?? other.max,
+            zeroAllowed: zeroAllowed ?? other.zeroAllowed,
+            dynamicAllowed: dynamicAllowed ?? other.dynamicAllowed,
+            levels: mergeUniqueStrings(levels, other.levels)
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case min
+        case max
+        case minimum
+        case maximum
+        case minTokens = "min_tokens"
+        case minTokensCamel = "minTokens"
+        case maxTokens = "max_tokens"
+        case maxTokensCamel = "maxTokens"
+        case zeroAllowed = "zero_allowed"
+        case zeroAllowedCamel = "zeroAllowed"
+        case dynamicAllowed = "dynamic_allowed"
+        case dynamicAllowedCamel = "dynamicAllowed"
+        case levels
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        min = container.lossyInt(forKey: .min)
+            ?? container.lossyInt(forKey: .minimum)
+            ?? container.lossyInt(forKey: .minTokens)
+            ?? container.lossyInt(forKey: .minTokensCamel)
+        max = container.lossyInt(forKey: .max)
+            ?? container.lossyInt(forKey: .maximum)
+            ?? container.lossyInt(forKey: .maxTokens)
+            ?? container.lossyInt(forKey: .maxTokensCamel)
+        zeroAllowed = container.lossyBool(forKey: .zeroAllowed)
+            ?? container.lossyBool(forKey: .zeroAllowedCamel)
+        dynamicAllowed = container.lossyBool(forKey: .dynamicAllowed)
+            ?? container.lossyBool(forKey: .dynamicAllowedCamel)
+        levels = container.lossyStringArray(forKey: .levels)
     }
 }
 
@@ -642,7 +891,13 @@ public enum ModelPoolAggregator {
                 var seenForAccount = Set<String>()
                 for model in models {
                     let key = model.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    guard !key.isEmpty, !seenForAccount.contains(key) else { continue }
+                    guard !key.isEmpty else { continue }
+                    if seenForAccount.contains(key) {
+                        if let existing = merged[key] {
+                            merged[key] = (mergeDefinitions(existing.model, model), existing.count)
+                        }
+                        continue
+                    }
                     seenForAccount.insert(key)
                     if let existing = merged[key] {
                         merged[key] = (mergeDefinitions(existing.model, model), existing.count + 1)
@@ -684,7 +939,20 @@ public enum ModelPoolAggregator {
             id: base.id,
             displayName: firstNonEmpty(base.displayName, other.displayName),
             type: firstNonEmpty(base.type, other.type),
-            ownedBy: firstNonEmpty(base.ownedBy, other.ownedBy)
+            ownedBy: firstNonEmpty(base.ownedBy, other.ownedBy),
+            description: firstNonEmpty(base.description, other.description),
+            contextLength: base.contextLength ?? other.contextLength,
+            maxCompletionTokens: base.maxCompletionTokens ?? other.maxCompletionTokens,
+            supportedInputModalities: mergeUniqueStrings(
+                base.supportedInputModalities,
+                other.supportedInputModalities
+            ),
+            supportedOutputModalities: mergeUniqueStrings(
+                base.supportedOutputModalities,
+                other.supportedOutputModalities
+            ),
+            supportsWebSearch: base.supportsWebSearch ?? other.supportsWebSearch,
+            thinking: base.thinking?.mergingMissingMetadata(from: other.thinking) ?? other.thinking
         )
     }
 }
@@ -707,9 +975,9 @@ public struct PoolSummary: Equatable, Sendable {
         self.quotaAccounts = accounts.filter { $0.usage?.hasQuotaSignal == true }.count
         self.errorAccounts = accounts.filter { ($0.errorMessage ?? "").isEmpty == false }.count
         self.disabledAccounts = accounts.filter(\.isDisabled).count
-        // The 5h/7d headline metric is Codex-specific: only Codex exposes rolling
-        // 5-hour and 7-day windows, so the average is scoped to Codex accounts and
-        // never polluted by other providers' quota shapes.
+        // These legacy summary fields remain Codex-specific. Provider-aware
+        // dashboard averages for Claude, Antigravity, and Grok live in
+        // DashboardMetrics.swift and never mix incompatible quota shapes.
         let codexAccounts = accounts.filter { $0.auth.isCodexLike }
         self.codexAccounts = codexAccounts.count
         self.primaryAverage = PoolSummary.average(codexAccounts.compactMap(\.primaryRemainingPercent))
@@ -764,7 +1032,8 @@ public enum ProviderCatalog {
         "codex-api-key": ProviderInfo(key: "codex-api-key", displayName: "Codex API Key", symbolName: "key.fill", accentName: "teal", priority: 40, supportsUsage: false),
         "claude-api-key": ProviderInfo(key: "claude-api-key", displayName: "Claude API Key", symbolName: "key.fill", accentName: "orange", priority: 41, supportsUsage: false),
         "gemini-api-key": ProviderInfo(key: "gemini-api-key", displayName: "Gemini API Key", symbolName: "key.fill", accentName: "blue", priority: 42, supportsUsage: false),
-        "vertex-api-key": ProviderInfo(key: "vertex-api-key", displayName: "Vertex API Key", symbolName: "key.fill", accentName: "indigo", priority: 43, supportsUsage: false)
+        "interactions-api-key": ProviderInfo(key: "interactions-api-key", displayName: "Interactions API Key", symbolName: "key.fill", accentName: "blue", priority: 43, supportsUsage: false),
+        "vertex-api-key": ProviderInfo(key: "vertex-api-key", displayName: "Vertex API Key", symbolName: "key.fill", accentName: "indigo", priority: 44, supportsUsage: false)
     ]
 
     private static let openAICompatiblePrefix = "openai-compatible-"
@@ -921,6 +1190,22 @@ private func cleanFileName(_ value: String?) -> String? {
     return result
 }
 
+private func firstNonEmptyArray(_ values: [String]...) -> [String] {
+    values.first(where: { !$0.isEmpty }) ?? []
+}
+
+private func mergeUniqueStrings(_ first: [String], _ second: [String]) -> [String] {
+    var seen = Set<String>()
+    var result: [String] = []
+    for value in first + second {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = trimmed.lowercased()
+        guard !key.isEmpty, seen.insert(key).inserted else { continue }
+        result.append(trimmed)
+    }
+    return result
+}
+
 private extension KeyedDecodingContainer {
     func lossyString(forKey key: Key) -> String? {
         if let value = try? decodeIfPresent(String.self, forKey: key) {
@@ -957,5 +1242,34 @@ private extension KeyedDecodingContainer {
             }
         }
         return nil
+    }
+
+    func lossyInt(forKey key: Key) -> Int? {
+        if let value = try? decodeIfPresent(Int.self, forKey: key) {
+            return value
+        }
+        if let value = try? decodeIfPresent(Double.self, forKey: key), value.isFinite {
+            return Int(value)
+        }
+        if let value = try? decodeIfPresent(String.self, forKey: key) {
+            return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    func lossyStringArray(forKey key: Key) -> [String] {
+        if let values = try? decodeIfPresent([String].self, forKey: key) {
+            return mergeUniqueStrings(values, [])
+        }
+        if let values = try? decodeIfPresent([Int].self, forKey: key) {
+            return values.map(String.init)
+        }
+        if let value = try? decodeIfPresent(String.self, forKey: key) {
+            let parts = value
+                .split(separator: ",", omittingEmptySubsequences: true)
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            return mergeUniqueStrings(parts, [])
+        }
+        return []
     }
 }

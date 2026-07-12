@@ -15,12 +15,27 @@ final class ConfigChannelTests: XCTestCase {
            "base-url": "https://api.opencode.example/v1",
            "api-key-entries": [{"api-key": "sk-1"}, {"api-key": "sk-2"}],
            "models": [
-             {"name": "big-upstream-v2", "alias": "big-model"},
+             {"name": "big-upstream-v2", "alias": "big-model", "force-mapping": true},
              {"name": "other-upstream", "alias": "big-model"},
              {"name": "plain-model"}
            ]}
         ]}
         """)
+
+        let accounts = ConfigChannelSynthesizer.compatAccounts(root: root)
+        XCTAssertEqual(accounts.count, 2)
+        XCTAssertEqual(accounts[0].routes.map(\.name), ["big-upstream-v2", "other-upstream", "plain-model"])
+        XCTAssertEqual(accounts[0].routes.map(\.alias), ["big-model", "big-model", "plain-model"])
+        XCTAssertTrue(accounts[0].routes[0].forceMapping)
+        XCTAssertEqual(accounts[0].models.map(\.id), ["big-model", "plain-model"])
+
+        let routing = ModelRoutingResolver.configRoutes(accounts: accounts, forceModelPrefix: false)
+        // Two API keys provide credential redundancy, not duplicate upstream targets.
+        XCTAssertEqual(routing.count, 3)
+        XCTAssertEqual(
+            routing.filter { $0.publicModelID == "big-model" }.map(\.upstreamModelName),
+            ["big-upstream-v2", "other-upstream"]
+        )
 
         let results = ConfigChannelSynthesizer.compatResults(root: root)
         XCTAssertEqual(results.count, 2)   // one per api key
@@ -54,6 +69,16 @@ final class ConfigChannelTests: XCTestCase {
         XCTAssertEqual(results.first?.auth.provider, "openai-compatible-keyless")
         // With a prefix the server registers both the plain and prefixed ids.
         XCTAssertEqual(results.first?.models?.map(\.id), ["m1", "team/m1"])
+
+        let accounts = ConfigChannelSynthesizer.compatAccounts(root: root)
+        XCTAssertEqual(
+            ModelRoutingResolver.configRoutes(accounts: accounts, forceModelPrefix: false).map(\.publicModelID),
+            ["m1", "team/m1"]
+        )
+        XCTAssertEqual(
+            ModelRoutingResolver.configRoutes(accounts: accounts, forceModelPrefix: true).map(\.publicModelID),
+            ["team/m1"]
+        )
     }
 
     // MARK: api-key sections
@@ -90,6 +115,71 @@ final class ConfigChannelTests: XCTestCase {
         XCTAssertEqual(group.provider.displayName, "Claude API Key")
         XCTAssertEqual(group.models.map(\.id), ["claude-fable-5"])
         XCTAssertEqual(group.models.first?.accountCount, 2)
+
+        let accounts = ConfigChannelSynthesizer.apiKeyAccounts(kind: .claude, entries: entries, staticModels: staticModels)
+        XCTAssertEqual(accounts[0].routes.map(\.name), ["claude-fable-5-internal"])
+        XCTAssertEqual(accounts[0].routes.map(\.alias), ["claude-fable-5"])
+        // No override: static catalog entries become truthful identity routes.
+        XCTAssertEqual(accounts[1].routes.map(\.name), ["claude-fable-5"])
+        XCTAssertEqual(accounts[1].routes.map(\.alias), ["claude-fable-5"])
+    }
+
+    func testAPIKeyMappingsKeepDuplicateAliasesWhileModelsStayDeduplicated() throws {
+        let root = try json("""
+        {"codex-api-key": [{
+          "api-key": "sk-codex",
+          "prefix": "team",
+          "priority": "12",
+          "proxy-url": "http://proxy.example",
+          "models": [
+            {"name": "gpt-upstream-a", "alias": "gpt-client"},
+            {"name": "gpt-upstream-b", "alias": "gpt-client", "forceMapping": true}
+          ]
+        }]}
+        """)
+
+        let entries = ConfigChannelSynthesizer.apiKeyEntries(kind: .codex, root: root)
+        XCTAssertEqual(entries.first?.overrideModelIDs, ["gpt-client"])
+        XCTAssertEqual(entries.first?.overrideRoutes.map(\.name), ["gpt-upstream-a", "gpt-upstream-b"])
+
+        let account = try XCTUnwrap(
+            ConfigChannelSynthesizer.apiKeyAccounts(kind: .codex, entries: entries, staticModels: []).first
+        )
+        XCTAssertEqual(account.models.map(\.id), ["gpt-client", "team/gpt-client"])
+        XCTAssertEqual(account.routes.map(\.alias), ["gpt-client", "gpt-client"])
+        XCTAssertEqual(account.routes.map(\.publicModelID), ["team/gpt-client", "team/gpt-client"])
+        XCTAssertEqual(
+            ModelRoutingResolver.configRoutes(accounts: [account], forceModelPrefix: false).map(\.publicModelID),
+            ["gpt-client", "team/gpt-client", "gpt-client", "team/gpt-client"]
+        )
+        XCTAssertEqual(
+            ModelRoutingResolver.configRoutes(accounts: [account], forceModelPrefix: true).map(\.publicModelID),
+            ["team/gpt-client", "team/gpt-client"]
+        )
+        XCTAssertTrue(account.routes[1].forceMapping)
+        XCTAssertEqual(account.auth.prefix, "team")
+        XCTAssertEqual(account.auth.priority, 12)
+        XCTAssertEqual(account.auth.proxyURL, "http://proxy.example")
+    }
+
+    func testInteractionsAPIKeyReusesGeminiDefinitions() throws {
+        XCTAssertEqual(APIKeyChannelKind.interactions.managementPath, "/v0/management/interactions-api-key")
+        XCTAssertEqual(APIKeyChannelKind.interactions.definitionsChannel, "gemini")
+
+        let root = try json("""
+        {"interactions-api-key": [{"api-key": "interaction-key"}]}
+        """)
+        let entries = ConfigChannelSynthesizer.apiKeyEntries(kind: .interactions, root: root)
+        let account = try XCTUnwrap(
+            ConfigChannelSynthesizer.apiKeyAccounts(
+                kind: .interactions,
+                entries: entries,
+                staticModels: [CPAModelDefinition(id: "gemini-3-pro")]
+            ).first
+        )
+        XCTAssertEqual(account.models.map(\.id), ["gemini-3-pro"])
+        XCTAssertEqual(account.routes.first?.name, "gemini-3-pro")
+        XCTAssertEqual(account.auth.provider, "interactions-api-key")
     }
 
     func testWildcardExclusionMatching() {
@@ -161,6 +251,9 @@ final class ConfigChannelTests: XCTestCase {
 
         let generic = ProviderCatalog.info(for: "openai-compatibility")
         XCTAssertEqual(generic.displayName, "OpenAI Compat")
+
+        let interactions = ProviderCatalog.info(for: "interactions-api-key")
+        XCTAssertEqual(interactions.displayName, "Interactions API Key")
     }
 
     func testConfigChannelsSortAfterOAuthProviders() throws {

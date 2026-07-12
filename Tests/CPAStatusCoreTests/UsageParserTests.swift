@@ -119,6 +119,93 @@ final class UsageParserTests: XCTestCase {
         XCTAssertEqual(snapshot.additionalWindows.last?.detailText, "05-28 01:09")
     }
 
+    func testParsesAntigravityRetrieveUserQuotaSummaryAtRoot() throws {
+        let body = """
+        {
+          "groups": [
+            {
+              "displayName": "Agent Models",
+              "description": "Models within this group: Claude, GPT",
+              "buckets": [
+                {
+                  "bucketId": "five-hour",
+                  "displayName": "5 hour",
+                  "window": "5h",
+                  "remainingFraction": 0.625,
+                  "resetTime": "2026-07-12T05:00:00Z",
+                  "description": "Shared agent quota"
+                },
+                {
+                  "bucket_id": "weekly",
+                  "display_name": "Weekly",
+                  "window": "weekly",
+                  "remaining_fraction": "80%"
+                }
+              ]
+            }
+          ]
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertNil(snapshot.planType)
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), [
+            "Agent Models · 5 hour",
+            "Agent Models · Weekly"
+        ])
+        XCTAssertEqual(snapshot.additionalWindows[0].remainingPercent, 62.5)
+        XCTAssertEqual(snapshot.additionalWindows[0].usedPercent, 37.5)
+        XCTAssertNotNil(snapshot.additionalWindows[0].resetAt)
+        XCTAssertTrue(snapshot.additionalWindows[0].detailText?.contains("5h") == true)
+        XCTAssertFalse(snapshot.additionalWindows[0].detailText?.contains("Models within this group") == true)
+        XCTAssertFalse(snapshot.additionalWindows[0].detailText?.contains("Shared agent quota") == true)
+        XCTAssertEqual(snapshot.additionalWindows[1].remainingPercent, 80)
+    }
+
+    func testParsesWrappedAntigravityQuotaAndSubscription() throws {
+        let body = """
+        {
+          "_provider": "antigravity",
+          "quota": {
+            "groups": [
+              {
+                "display_name": "Gemini",
+                "buckets": [
+                  {
+                    "bucket_id": "daily",
+                    "display_name": "Daily",
+                    "remaining_fraction": 0.4,
+                    "window": "24h"
+                  }
+                ]
+              }
+            ]
+          },
+          "subscription": {
+            "plan": "ultra",
+            "tierName": "Google AI Ultra",
+            "tierId": "g1-ultra-tier",
+            "paidTier": {
+              "availableCredits": [{
+                "creditType": "GOOGLE_ONE_AI",
+                "creditAmount": 12,
+                "minimumCreditAmountForUsage": 5
+              }]
+            }
+          }
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertEqual(snapshot.planType, "ultra")
+        XCTAssertEqual(snapshot.additionalWindows.count, 2)
+        XCTAssertEqual(snapshot.additionalWindows[0].label, "Gemini · Daily")
+        XCTAssertEqual(snapshot.additionalWindows[0].remainingPercent, 40)
+        XCTAssertEqual(snapshot.additionalWindows[0].detailText, "24h")
+        XCTAssertEqual(snapshot.additionalWindows[1].label, "Google One AI")
+        XCTAssertEqual(snapshot.additionalWindows[1].displayValue, "12")
+    }
+
     func testParsesClaudeQuotaRowsLikeWebUI() throws {
         let body = """
         {
@@ -206,6 +293,188 @@ final class UsageParserTests: XCTestCase {
         XCTAssertEqual(snapshot.additionalWindows.last?.remainingPercent, 75)
         XCTAssertEqual(snapshot.additionalWindows.last?.amountText, "$25.00 / $100.00")
         XCTAssertEqual(snapshot.additionalWindows.last?.detailText, "05-28 01:31")
+    }
+
+    func testParsesWrappedXAIWeeklyMonthlyAndProductUsage() throws {
+        let body = """
+        {
+          "_provider": "xai",
+          "weekly": {
+            "config": {
+              "currentPeriod": {
+                "type": "weekly",
+                "start": "2026-07-06T00:00:00Z",
+                "end": "2026-07-13T00:00:00Z"
+              },
+              "creditUsagePercent": 35,
+              "productUsage": [
+                { "product": "Grok 4 Fast", "usagePercent": 80 },
+                { "product": "Grok Code", "usage_percent": "12.5" }
+              ]
+            }
+          },
+          "monthly": {
+            "config": {
+              "monthlyLimit": { "val": 10000 },
+              "used": { "val": 2500 },
+              "onDemandCap": { "val": 5000 },
+              "onDemandUsed": { "val": 1000 },
+              "billingPeriodEnd": "2026-08-01T00:00:00Z"
+            }
+          }
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), [
+            "周积分",
+            "Grok 4 Fast 使用",
+            "Grok Code 使用",
+            "按量付费",
+            "月度积分"
+        ])
+        XCTAssertEqual(snapshot.additionalWindows[0].remainingPercent, 65)
+        XCTAssertEqual(snapshot.additionalWindows[1].remainingPercent, 20)
+        XCTAssertEqual(snapshot.additionalWindows[2].remainingPercent, 87.5)
+        XCTAssertEqual(snapshot.additionalWindows[3].remainingPercent, 80)
+        XCTAssertEqual(snapshot.additionalWindows[3].amountText, "已用 $10.00 / 封顶 $50.00")
+        XCTAssertEqual(snapshot.additionalWindows[4].remainingPercent, 75)
+        XCTAssertEqual(snapshot.additionalWindows[4].amountText, "$25.00 / $100.00")
+    }
+
+    func testParsesCodexCodeReviewMonthlyAdditionalAndResetCredits() throws {
+        let body = """
+        {
+          "plan_type": "team",
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 10,
+              "limit_window_seconds": 18000
+            },
+            "secondary_window": {
+              "used_percent": 20,
+              "limit_window_seconds": 2678400
+            }
+          },
+          "code_review_rate_limit": {
+            "primary_window": {
+              "used_percent": 30,
+              "limit_window_seconds": 18000
+            },
+            "secondary_window": {
+              "used_percent": 40,
+              "limit_window_seconds": 2419200
+            }
+          },
+          "additional_rate_limits": [
+            {
+              "limit_name": "deep-research",
+              "rate_limit": {
+                "primary_window": {
+                  "used_percent": 50,
+                  "limit_window_seconds": 18000
+                },
+                "secondary_window": {
+                  "used_percent": 60,
+                  "limit_window_seconds": 604800
+                }
+              }
+            }
+          ],
+          "rate_limit_reset_credits": {
+            "available_count": 3
+          }
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertEqual(snapshot.planType, "team")
+        XCTAssertEqual(snapshot.primary?.remainingPercent, 90)
+        XCTAssertEqual(snapshot.weekly?.label, "月度限额")
+        XCTAssertEqual(snapshot.weekly?.remainingPercent, 80)
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), [
+            "代码审查 5h",
+            "代码审查月度限额",
+            "deep-research 5h",
+            "deep-research 7d",
+            "主动重置次数"
+        ])
+        XCTAssertEqual(snapshot.additionalWindows[0].remainingPercent, 70)
+        XCTAssertEqual(snapshot.additionalWindows[1].remainingPercent, 60)
+        XCTAssertEqual(snapshot.additionalWindows[3].remainingPercent, 40)
+        XCTAssertNil(snapshot.additionalWindows[4].remainingPercent)
+        XCTAssertNil(snapshot.additionalWindows[4].usedPercent)
+        XCTAssertEqual(snapshot.additionalWindows[4].displayValue, "3")
+    }
+
+    func testParsesCodexResetCreditDetailsAndFiltersUnavailableOrWrongType() throws {
+        let body = """
+        {
+          "rate_limit_reset_credits": {
+            "available_count": "4",
+            "credits": [
+              {
+                "id": "credit-a",
+                "status": "available",
+                "reset_type": "codex_rate_limits",
+                "granted_at": "2026-07-01T00:00:00Z",
+                "expires_at": "2026-08-01T00:00:00Z"
+              },
+              {
+                "id": "credit-b",
+                "status": "AVAILABLE",
+                "resetType": "codex_rate_limits",
+                "grantedAt": "2026-07-02T00:00:00Z",
+                "expiresAt": "2026-08-02T00:00:00Z"
+              },
+              {
+                "id": "credit-consumed",
+                "status": "consumed",
+                "reset_type": "codex_rate_limits",
+                "expires_at": "2026-08-03T00:00:00Z"
+              },
+              {
+                "id": "credit-other",
+                "status": "available",
+                "reset_type": "other_product",
+                "expires_at": "2026-08-04T00:00:00Z"
+              },
+              {
+                "id": "credit-no-expiry",
+                "status": "available",
+                "reset_type": "codex_rate_limits"
+              }
+            ]
+          }
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), [
+            "主动重置次数",
+            "主动重置券 #1",
+            "主动重置券 #2"
+        ])
+        XCTAssertEqual(snapshot.additionalWindows[0].displayValue, "4")
+
+        let firstCredit = snapshot.additionalWindows[1]
+        XCTAssertEqual(firstCredit.id, "code-reset-credit-credit-a")
+        XCTAssertEqual(firstCredit.displayValue, "可用")
+        XCTAssertEqual(
+            firstCredit.resetAt,
+            ISO8601DateFormatter().date(from: "2026-08-01T00:00:00Z")
+        )
+        XCTAssertTrue(firstCredit.detailText?.hasPrefix("到期 ") == true)
+
+        let secondCredit = snapshot.additionalWindows[2]
+        XCTAssertEqual(secondCredit.id, "code-reset-credit-credit-b")
+        XCTAssertEqual(
+            secondCredit.resetAt,
+            ISO8601DateFormatter().date(from: "2026-08-02T00:00:00Z")
+        )
+        XCTAssertFalse(snapshot.additionalWindows.contains { $0.id.contains("consumed") })
+        XCTAssertFalse(snapshot.additionalWindows.contains { $0.id.contains("other") })
+        XCTAssertFalse(snapshot.additionalWindows.contains { $0.id.contains("no-expiry") })
     }
 
     func testBuildsManagementURLWithExistingPath() throws {
