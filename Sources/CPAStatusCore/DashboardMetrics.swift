@@ -17,7 +17,10 @@ public struct AccountHealthRatio: Equatable, Sendable {
 
 public extension AccountQuota {
     var isHealthy: Bool {
-        !isDisabled && !isUnavailable && (errorMessage ?? "").isEmpty
+        let status = auth.status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return !isDisabled && !isUnavailable && (errorMessage ?? "").isEmpty
+            && status != "error" && status != "failed"
+            && (detail?.lastErrorMessage ?? "").isEmpty
     }
 }
 

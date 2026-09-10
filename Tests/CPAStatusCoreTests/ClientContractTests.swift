@@ -314,6 +314,20 @@ final class ClientContractTests: XCTestCase {
         XCTAssertFalse(encodedURL.contains("测试"))
     }
 
+    func testModelLookupsUseDistinctAccountIDsForSharedFilenames() async throws {
+        StubURLProtocol.handler = { request in
+            let components = try XCTUnwrap(URLComponents(url: request.url!, resolvingAgainstBaseURL: false))
+            let id = try XCTUnwrap(components.queryItems?.first { $0.name == "name" }?.value)
+            XCTAssertNotEqual(id, "shared.json")
+            return StubURLProtocol.jsonResponse(request, status: 200, object: ["models": [["id": "model-\(id)"]]])
+        }
+        let client = makeClient()
+        for id in ["virtual-a", "virtual-b"] {
+            let models = try await client.fetchModels(for: AuthFile(id: id, name: "shared.json", provider: "codex"))
+            XCTAssertEqual(models.map(\.id), ["model-\(id)"])
+        }
+    }
+
     private func makeClient() -> CLIProxyAPIClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]

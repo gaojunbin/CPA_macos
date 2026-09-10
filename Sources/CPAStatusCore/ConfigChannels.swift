@@ -9,6 +9,18 @@ public enum APIKeyChannelKind: String, CaseIterable, Sendable {
     case interactions = "interactions-api-key"
     case vertex = "vertex-api-key"
 
+    var modelType: String {
+        self == .codex ? "openai" : definitionsChannel
+    }
+
+    var modelOwner: String {
+        switch self {
+        case .codex: return "openai"
+        case .claude: return "anthropic"
+        case .gemini, .interactions, .vertex: return "google"
+        }
+    }
+
     public var managementPath: String { "/v0/management/\(rawValue)" }
 
     /// Channel key for `/v0/management/model-definitions/:channel`, used when an
@@ -32,6 +44,7 @@ public struct APIKeyChannelEntry: Equatable, Sendable {
     /// Full upstream-to-alias mappings. Unlike `overrideModelIDs`, repeated
     /// aliases are intentionally retained because they form a routing pool.
     public let overrideRoutes: [ModelRouteDefinition]
+    public let overrideModels: [CPAModelDefinition]
     /// `excluded-models` patterns (may contain `*` wildcards).
     public let excludedPatterns: [String]
     /// Optional model prefix; when set the server also registers `prefix/<id>`.
@@ -52,11 +65,13 @@ public struct APIKeyChannelEntry: Equatable, Sendable {
         maskedKey: String? = nil,
         baseURL: String? = nil,
         overrideRoutes: [ModelRouteDefinition] = [],
+        overrideModels: [CPAModelDefinition] = [],
         priority: Int? = nil,
         proxyURL: String? = nil
     ) {
         self.overrideModelIDs = overrideModelIDs
         self.overrideRoutes = overrideRoutes
+        self.overrideModels = overrideModels
         self.excludedPatterns = excludedPatterns
         self.prefix = prefix
         self.maskedKey = maskedKey
@@ -354,10 +369,16 @@ public enum ConfigChannelSynthesizer {
                 prefix: prefix,
                 source: providerKey
             )
-            let models = deduplicatedIDs(
-                routes.flatMap { withPrefixVariants($0.alias, prefix: $0.prefix) }
+            let models = deduplicatedModelDefinitions(
+                ConfiguredModelMetadata.definitions(
+                    firstArray(dict["models"]),
+                    type: "openai-compatibility",
+                    ownedBy: name,
+                    useUpstreamName: false
+                ).flatMap { model in
+                    withPrefixVariants(model.id, prefix: prefix).map { model.withID($0) }
+                }
             )
-                .map { CPAModelDefinition(id: $0, displayName: nil, type: "openai-compatibility", ownedBy: name) }
 
             let keyEntries = firstArray(dict["api-key-entries"], dict["apiKeyEntries"]) ?? []
             let credentials: [(maskedKey: String?, proxyURL: String?)] = keyEntries.isEmpty
@@ -430,6 +451,12 @@ public enum ConfigChannelSynthesizer {
                 maskedKey: firstString(dict["api-key"], dict["apiKey"]).map(maskedSecret),
                 baseURL: firstString(dict["base-url"], dict["baseURL"], dict["baseUrl"]),
                 overrideRoutes: routes,
+                overrideModels: ConfiguredModelMetadata.definitions(
+                    firstArray(dict["models"]),
+                    type: kind.modelType,
+                    ownedBy: kind.modelOwner,
+                    useUpstreamName: true
+                ),
                 priority: integerValue(dict["priority"]),
                 proxyURL: firstString(dict["proxy-url"], dict["proxyURL"], dict["proxyUrl"])
             )
@@ -447,37 +474,29 @@ public enum ConfigChannelSynthesizer {
     ) -> [ConfigChannelAccount] {
         entries.enumerated().map { index, entry in
             let hasOverrides = !entry.overrideRoutes.isEmpty || !entry.overrideModelIDs.isEmpty
-            let base: [CPAModelDefinition]
             let routes: [ModelRouteDefinition]
-            if !hasOverrides {
-                base = staticModels.filter { !matchesExcluded($0.id, patterns: entry.excludedPatterns) }
-                routes = base.map {
-                    ModelRouteDefinition(
-                        name: $0.id,
-                        alias: $0.id,
-                        prefix: entry.prefix,
-                        source: kind.rawValue
-                    )
-                }
-            } else {
-                routes = entry.overrideRoutes.isEmpty
+            let baseModels: [CPAModelDefinition]
+            if hasOverrides {
+                let configuredRoutes = entry.overrideRoutes.isEmpty
                     ? entry.overrideModelIDs.map {
-                        ModelRouteDefinition(
-                            name: $0,
-                            alias: $0,
-                            prefix: entry.prefix,
-                            source: kind.rawValue
-                        )
+                        ModelRouteDefinition(name: $0, alias: $0, prefix: entry.prefix, source: kind.rawValue)
                     }
                     : entry.overrideRoutes
-                base = deduplicatedIDs(routes.map(\.alias)).map {
-                    CPAModelDefinition(id: $0, displayName: nil, type: nil, ownedBy: kind.definitionsChannel)
+                routes = configuredRoutes.filter { !matchesExcluded($0.alias, patterns: entry.excludedPatterns) }
+                let configuredModels = entry.overrideModels.isEmpty
+                    ? deduplicatedIDs(configuredRoutes.map(\.alias)).map {
+                        CPAModelDefinition(id: $0, ownedBy: kind.definitionsChannel)
+                    }
+                    : entry.overrideModels
+                baseModels = configuredModels.filter { !matchesExcluded($0.id, patterns: entry.excludedPatterns) }
+            } else {
+                baseModels = staticModels.filter { !matchesExcluded($0.id, patterns: entry.excludedPatterns) }
+                routes = baseModels.map {
+                    ModelRouteDefinition(name: $0.id, alias: $0.id, prefix: entry.prefix, source: kind.rawValue)
                 }
             }
-            let models = deduplicatedModelDefinitions(base.flatMap { model -> [CPAModelDefinition] in
-                withPrefixVariants(model.id, prefix: entry.prefix).map { id in
-                    CPAModelDefinition(id: id, displayName: id == model.id ? model.displayName : nil, type: model.type, ownedBy: model.ownedBy)
-                }
+            let models = deduplicatedModelDefinitions(baseModels.flatMap { model in
+                withPrefixVariants(model.id, prefix: entry.prefix).map { model.withID($0) }
             })
             let auth = AuthFile(
                 id: "\(kind.rawValue)#\(index)",

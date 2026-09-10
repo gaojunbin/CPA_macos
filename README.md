@@ -1,5 +1,7 @@
 # CPA
 
+Compatibility baseline and audit evidence: [CPA_SYNC.md](CPA_SYNC.md). Contributor instructions: [AGENTS.md](AGENTS.md).
+
 Native macOS menu bar monitor for CLIProxyAPI OAuth pools, upstream balances, and model routing across Codex/OpenAI, Claude, Antigravity, Grok/xAI, Kimi, and config-based providers.
 
 It reads the management API with the configured password, then refreshes each Codex account through:

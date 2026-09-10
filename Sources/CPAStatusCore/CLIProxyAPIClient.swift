@@ -160,7 +160,8 @@ public struct CLIProxyAPIClient: Sendable {
         guard settings.isConfigured else {
             throw PoolClientError.notConfigured
         }
-        let queryName = auth.name.isEmpty ? auth.id : auth.name
+        // Multiple virtual accounts can share a filename; the server also accepts the unique auth ID.
+        let queryName = auth.id.isEmpty ? auth.name : auth.id
         var components = URLComponents(
             url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/models"),
             resolvingAgainstBaseURL: false
