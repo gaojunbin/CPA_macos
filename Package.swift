@@ -8,7 +8,8 @@ let package = Package(
     ],
     products: [
         .library(name: "CPAStatusCore", targets: ["CPAStatusCore"]),
-        .executable(name: "CPAStatusBar", targets: ["CPAStatusBar"])
+        .executable(name: "CPAStatusBar", targets: ["CPAStatusBar"]),
+        .executable(name: "CPAUpdateInstaller", targets: ["CPAUpdateInstaller"])
     ],
     targets: [
         .target(
@@ -23,6 +24,11 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit")
             ]
+        ),
+        .executableTarget(
+            name: "CPAUpdateInstaller",
+            dependencies: ["CPAStatusCore"],
+            linkerSettings: [.linkedFramework("AppKit")]
         ),
         .testTarget(
             name: "CPAStatusCoreTests",

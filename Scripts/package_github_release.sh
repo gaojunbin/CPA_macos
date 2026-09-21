@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="${APP_NAME:-CPA}"
 APP_VARIANT="${APP_VARIANT:-native}"
-DIST_DIR="$ROOT_DIR/dist"
+DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
+export DIST_DIR
 OUTPUT_DIR="${OUTPUT_DIR:-$DIST_DIR/github}"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 WORK_DIR="$(mktemp -d)"
@@ -17,8 +18,8 @@ usage() {
 Usage: Scripts/package_github_release.sh
 
 Environment:
-  VERSION=1.0.0                 Version used in artifact names. Defaults to tag,
-                                app Info.plist version, or git commit.
+  VERSION=1.0.0                 Version used in artifact names and the native
+                                bundle. Defaults to the app version.
   APP_VARIANT=native|jxa        App bundle builder to use. Defaults to native.
   OUTPUT_DIR=dist/github        Directory for release artifacts.
   CODESIGN_IDENTITY=-           Signing identity. Defaults to ad-hoc signing.
@@ -56,11 +57,7 @@ if [[ ! -d "$APP_DIR" ]]; then
 fi
 
 if [[ -z "${VERSION:-}" ]]; then
-  if git -C "$ROOT_DIR" describe --tags --exact-match >/dev/null 2>&1; then
-    VERSION="$(git -C "$ROOT_DIR" describe --tags --exact-match)"
-  else
-    VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
-  fi
+  VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
 fi
 
 if [[ -z "${VERSION:-}" ]]; then
@@ -72,6 +69,13 @@ if [[ -z "${VERSION:-}" ]]; then
 fi
 
 VERSION="${VERSION#v}"
+if [[ "$APP_VARIANT" == "native" ]]; then
+  BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_DIR/Contents/Info.plist")"
+  if [[ "$VERSION" != "$BUNDLE_VERSION" ]]; then
+    echo "Release version does not match the application version." >&2
+    exit 2
+  fi
+fi
 SAFE_VERSION="$(printf "%s" "$VERSION" | tr -c "[:alnum:]._" "-")"
 ARTIFACT_BASENAME="${ARTIFACT_BASENAME:-$APP_NAME-$SAFE_VERSION-macOS}"
 DMG_PATH="$OUTPUT_DIR/$ARTIFACT_BASENAME.dmg"

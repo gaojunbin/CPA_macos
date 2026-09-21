@@ -6,12 +6,23 @@ APP_NAME="CPA"
 BUNDLE_ID="local.cpa.statusbar"
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
 ICON_FILE="$ROOT_DIR/Resources/AppIcon.icns"
-DIST_DIR="$ROOT_DIR/dist"
+DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
+BUILD_DIR="${BUILD_DIR:-/tmp/cpa-macos-build}"
+APP_VERSION="${VERSION:-1.4.0}"
+APP_VERSION="${APP_VERSION#v}"
+if [[ ! "$APP_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "Expected a stable semantic version, got: $APP_VERSION" >&2
+  exit 2
+fi
+read -r -a BUILD_ARCHS <<< "${ARCHS:-arm64 x86_64}"
+BUILD_ARGS=()
+for arch in "${BUILD_ARCHS[@]}"; do BUILD_ARGS+=(--arch "$arch"); done
 
 cd "$ROOT_DIR"
-swift build -c "$BUILD_CONFIG" --product CPAStatusBar
+swift build -c "$BUILD_CONFIG" --scratch-path "$BUILD_DIR" "${BUILD_ARGS[@]}"
+BIN_DIR="$(swift build -c "$BUILD_CONFIG" --scratch-path "$BUILD_DIR" "${BUILD_ARGS[@]}" --show-bin-path)"
 
-BINARY="$ROOT_DIR/.build/$BUILD_CONFIG/CPAStatusBar"
+BINARY="$BIN_DIR/CPAStatusBar"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -19,10 +30,12 @@ STAGE_APP="$TMP_DIR/$APP_NAME.app"
 CONTENTS="$STAGE_APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
+HELPERS="$CONTENTS/Helpers"
 
 mkdir -p "$DIST_DIR"
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS" "$RESOURCES"
+mkdir -p "$MACOS" "$RESOURCES" "$HELPERS"
+cp "$BIN_DIR/CPAUpdateInstaller" "$HELPERS/CPAUpdateInstaller"
 cp "$BINARY" "$MACOS/$APP_NAME"
 chmod +x "$MACOS/$APP_NAME"
 cp "$ICON_FILE" "$RESOURCES/AppIcon.icns"
@@ -45,9 +58,11 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.3.1</string>
+  <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>7</string>
+  <string>8</string>
+  <key>CPAUpdateProtocol</key>
+  <integer>1</integer>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>LSUIElement</key>

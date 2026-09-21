@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshTask: Task<Void, Never>?
     private var refreshGeneration = 0
     private var timer: Timer?
+    private let updates = AppUpdateController()
 
     private var selectedProfile: ServiceProfile? {
         profiles.first { $0.id == selectedID }
@@ -47,6 +48,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         syncControllerState()
         controller.state.screen = isConfigured ? .dashboard : .services
         controller.render()
+        controller.updates = updates
+        updates.canRestart = { [weak self] in
+            guard let self, !self.popover.isShown else { return false }
+            switch self.controller.state.screen {
+            case .serviceEditor, .addAccount, .apiKeys: return false
+            default: return true
+            }
+        }
+        updates.start()
 
         if isConfigured {
             refresh()
@@ -59,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        updates.stop()
         refreshTask?.cancel()
         timer?.invalidate()
     }
@@ -486,6 +497,7 @@ final class PopoverViewController: NSViewController {
     var onSaveProfile: ((ServiceDraft) -> Void)?
     var onDeleteProfile: ((UUID) -> Void)?
     var onQuit: (() -> Void)?
+    var updates: AppUpdateController?
     /// Asks the app delegate to keep the popover open across the browser hand-off during OAuth.
     var onHoldOpen: ((Bool) -> Void)?
 
@@ -979,6 +991,13 @@ final class PopoverViewController: NSViewController {
         }
         addFullWidth(titleRow, to: root)
 
+        let updateButton = CallbackButton(title: "软件更新…") { [weak self] in
+            guard let self else { return }
+            self.showUpdateMenu(from: self.view)
+        }
+        updateButton.bezelStyle = .rounded
+        addFullWidth(updateButton, to: root)
+
         if let error = state.errorMessage {
             addFullWidth(messageView(text: error), to: root)
         }
@@ -1371,11 +1390,30 @@ final class PopoverViewController: NSViewController {
             self?.onOpenServices?()
         })
         menu.addItem(.separator())
+        addUpdateItems(to: menu)
+        menu.addItem(.separator())
         menu.addItem(CallbackMenuItem(title: "退出 CPA") { [weak self] in
             self?.onQuit?()
         })
         let location = NSPoint(x: 0, y: view.bounds.height + 4)
         menu.popUp(positioning: nil, at: location, in: view)
+    }
+
+    private func showUpdateMenu(from view: NSView) {
+        let menu = NSMenu()
+        addUpdateItems(to: menu)
+        menu.popUp(positioning: nil, at: NSPoint(x: 16, y: view.bounds.height - 80), in: view)
+    }
+
+    private func addUpdateItems(to menu: NSMenu) {
+        guard let updates else { return }
+        let status = NSMenuItem(title: updates.status, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+        menu.addItem(CallbackMenuItem(title: updates.actionTitle) { updates.checkManually() })
+        let automatic = CallbackMenuItem(title: "自动检查并安装更新") { updates.toggleAutomaticUpdates() }
+        automatic.state = updates.automaticallyUpdates ? .on : .off
+        menu.addItem(automatic)
     }
 
     private func openAddAccount() {
@@ -3370,7 +3408,7 @@ final class PopoverViewController: NSViewController {
                 row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
                 added = true
             }
-            addRow("原因", detail?.quotaReason ?? account.auth.statusMessage)
+            addRow("原因", detail?.activeCooldowns.first(where: { $0.scope == "credential" })?.reasonDescription ?? detail?.quotaReason ?? account.auth.statusMessage)
             if let date = detail?.nextRecoveryDate {
                 addRow("预计恢复", absoluteTime(date))
             }
@@ -3755,7 +3793,7 @@ final class PopoverViewController: NSViewController {
 
     private func modelRuntime(_ model: CPAModelDefinition, account: AccountQuota) -> (rank: Int, title: String, color: NSColor) {
         let keys = [model.id.lowercased(), (model.displayName ?? "").lowercased()].filter { !$0.isEmpty }
-        let modelState = account.detail?.modelStates.first { keys.contains($0.key.lowercased()) }?.value
+        let modelState = account.detail?.modelRuntimeStates.first { keys.contains($0.key.lowercased()) }?.value
         guard let modelState else {
             if account.configModels != nil {
                 return (3, "已配置", .systemBlue)
@@ -3775,7 +3813,9 @@ final class PopoverViewController: NSViewController {
         if status.contains("pending") || status.contains("refresh") {
             return (2, "同步中", .systemBlue)
         }
-        return (3, "可用", .systemGreen)
+        if status == "active" || status == "available" { return (3, "可用", .systemGreen) }
+        if status == "disabled" { return (2, "已停用", .secondaryLabelColor) }
+        return (3, "状态未知", .secondaryLabelColor)
     }
 
     private func providerBadgeView(for auth: AuthFile, size: CGFloat = 30) -> NSView {

@@ -314,7 +314,7 @@ public struct AccountQuota: Identifiable, Equatable, Sendable {
     }
 
     public var isUnavailable: Bool {
-        auth.unavailable || isDisabled
+        auth.unavailable || isDisabled || detail?.activeCooldowns.contains(where: { $0.scope == "credential" }) == true
     }
 
     public var effectivePlanType: String? {
@@ -388,6 +388,7 @@ public struct AccountCredits: Equatable, Sendable {
 /// Rich per-account runtime data parsed from a single `/v0/management/auth-files` list entry.
 /// Mirrors the fields the iOS detail screen surfaces, parsed leniently from raw JSON.
 public struct AccountDetail: Equatable, Sendable {
+    public let cooldowns: [AccountCooldown]?
     public let success: Int
     public let failed: Int
     public let recentRequests: [RecentRequestBucket]
@@ -414,6 +415,12 @@ public struct AccountDetail: Equatable, Sendable {
 
     public init(dict: [String: Any]) {
         let now = Date()
+        if let raw = dict["cooldowns"] as? [[String: Any]],
+           let data = try? JSONSerialization.data(withJSONObject: raw) {
+            cooldowns = try? JSONDecoder().decode([AccountCooldown].self, from: data)
+        } else {
+            cooldowns = nil
+        }
         success = integerValue(firstValue(dict["success"])) ?? 0
         failed = integerValue(firstValue(dict["failed"])) ?? 0
         recentRequests = (firstArray(dict["recent_requests"], dict["recentRequests"]) ?? []).compactMap { item in
@@ -484,10 +491,25 @@ public struct AccountDetail: Equatable, Sendable {
         return Double(success) / Double(totalRequests)
     }
 
+    public var activeCooldowns: [AccountCooldown] { (cooldowns ?? []).filter(\.isActive) }
+
+    public var modelRuntimeStates: [String: AccountModelState] {
+        guard cooldowns != nil else { return modelStates }
+        var states: [String: AccountModelState] = [:]
+        for cooldown in activeCooldowns where cooldown.scope == "model" {
+            guard let key = cooldown.modelKey, !key.isEmpty else { continue }
+            states[key] = AccountModelState(
+                status: "cooling", statusMessage: cooldown.reasonDescription, unavailable: true,
+                nextRetryAfter: cooldown.retryAt, lastErrorMessage: nil, quotaExceeded: false
+            )
+        }
+        return states
+    }
+
     /// Models currently cooling, exhausted, or in error, sorted by name.
     public var activeModelCooldowns: [(model: String, state: AccountModelState)] {
         let now = Date()
-        return modelStates
+        return modelRuntimeStates
             .filter { _, state in
                 let status = (state.status ?? "").lowercased()
                 let hasFutureRetry = state.nextRetryAfter.map { $0 > now } == true
@@ -503,6 +525,7 @@ public struct AccountDetail: Equatable, Sendable {
 
     /// Soonest future recovery time across the account quota, retry, and per-model states.
     public var nextRecoveryDate: Date? {
+        if cooldowns != nil { return activeCooldowns.compactMap(\.retryAt).min() }
         let now = Date()
         func future(_ date: Date?) -> Date? {
             guard let date, date > now else { return nil }

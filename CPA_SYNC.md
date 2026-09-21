@@ -4,68 +4,67 @@
 
 | Item | Audited value |
 | --- | --- |
-| Audit date | 2026-09-10 |
+| Audit date | 2026-09-21 |
 | Upstream repository | https://github.com/router-for-me/CLIProxyAPI |
-| Read-only local reference | `../CLIProxyAPI` |
-| Upstream tag | `v7.2.155` |
-| Upstream full commit | `7fac6b15bcfe5ea55c18c9eaec8e5b7e6457d974` |
-| Upstream commit date | `2026-09-09T01:33:09+08:00` |
-| Previous explicitly recorded upstream baseline | None found; the old client commit dates do not establish an upstream version |
-| Cloud deployment version | Not inspected; do not infer it from this local checkout |
-| Sync scope | Existing native-client features and information only |
+| Local reference | `../CLIProxyAPI` |
+| Upstream tag | `v7.3.10` |
+| Upstream full commit | `a5ab69521f7b4e0f244836d0419da8fcd89408ea` |
+| Upstream commit date | `2026-09-21T04:13:44+08:00` |
+| Previous audited upstream | `v7.2.155`, `7fac6b15bcfe5ea55c18c9eaec8e5b7e6457d974` |
+| Cloud deployment version | Not inspected |
+| Scope | Preserve existing native-client features and information |
 
-This is a source compatibility audit of the exact local revision above, not a claim that it is the latest public release or that the cloud deployment has been upgraded. The upstream working tree and HEAD were unchanged. Publishing these client changes to GitHub does not upgrade the cloud deployment or install a client binary. Release packaging and installation are separate steps.
+The user explicitly requested refreshing upstream. Its clean `main` branch was fetched and fast-forwarded to `origin/main` at the revision above, then treated as a read-only reference. No upstream source was edited. This does not upgrade any deployed proxy or prove live provider connectivity.
 
-## Shared corrections
+## Adaptation
 
-- Account model requests now use the unique backend auth ID in the existing `name` query parameter. Virtual accounts sharing a filename no longer query the same account model list.
-- Config model synthesis now retains `display-name`, positive `max-context-length`, configured thinking capabilities, and compatibility-channel input/output modalities.
-- Prefix expansion preserves the model's display name, description, token limits, modalities, web-search flag, and thinking capabilities instead of rebuilding a partial model object.
-- `excluded-models` applies to explicit aliases as well as default models, before prefix expansion. When all explicit models are excluded, the result remains empty. Duplicate upstream targets sharing a surviving alias remain separate routing entries.
-- A backend error status or explicit last error no longer counts as a healthy account merely because a quota request succeeded. Low remaining quota alone still does not change connection health.
+- Decode the current `cooldowns` snapshot, including credential/model scope, model key, reason, and fractional RFC3339 retry deadlines. Show current restrictions in existing detail/model views.
+- Keep `cooldowns: null` or a missing field unknown. An empty array means no reported retry timers; it does not prove model availability. Ignore expired or malformed retry deadlines, and do not retain synthetic stale model restrictions.
+- Keep credential-wide restrictions separate from partial model restrictions. A partial model cooldown does not make the entire account unhealthy. Explicit account failures and disablement still take precedence.
+- Keep passive `quota.signals` and `model_quotas` separate from scheduler cooldowns and live provider quota requests.
+- Preserve existing model aliases, duplicate upstream routes, exclusions, prefixes, display/capability metadata, and base-URL-only configuration channels.
 
-## Contract review
+## Contract audit
 
-| Existing surface | Upstream source and result |
+| Existing surface | Current result |
 | --- | --- |
-| Management access | `internal/api/server_management.go` and `handlers/management/handler.go`: existing `/v0/management` paths and bearer management authentication remain compatible. Home mode is not a supported management target. |
-| Accounts and identity | `handlers/management/auth_files.go`: `files`, stable `id`, `auth_index`, names, provider, status, disabled/unavailable, counters, recent requests, subscription claims and timestamps still decode. Model lookup uses the backend account ID; file download still uses the filename. |
-| Passive quota observations | `auth_files.go` now exposes `quota.observed_at/signals` and `model_quotas`. These are not scheduler state; do not reinterpret them as cooldowns or as live quota windows. Existing direct quota queries remain the source of live usage. |
-| Account models | `GetAuthFileModels` currently returns `id`, optional `display_name`, `type`, and `owned_by`. Rich capabilities and per-model runtime state are not guaranteed by this endpoint. Registration does not prove present request availability. |
-| Quota request proxy | `handlers/management/api_tools.go`: POST JSON still uses `auth_index`, `method`, `url`, `header`, and optional string `data`; response `status_code` and string `body` remain compatible. `$TOKEN$` is resolved on the server. No inference requests or reset-credit consumption were added. |
-| Config inventory | Existing OpenAI-compatible, Codex, Claude, Gemini, Interactions, and Vertex sections remain readable. Additional `auth-index` and other unused fields do not break parsing. Base-URL-only credentials were already accepted by the client and are covered by regression fixtures. |
-| Model defaults and aliases | `sdk/cliproxy/service_models.go`, `internal/config/config_types.go`, and `internal/registry/model_registry.go`: config metadata, explicit/default selection, alias exclusions, prefix policy, and first-alias model deduplication were checked. |
-| Routing | OAuth alias/exclusion paths, file-backed routing metadata, strategy, and force-prefix paths remain compatible. `weighted-round-robin` and unknown strategy strings are already displayed verbatim; no strategy editor or weight controls were added. |
-| API keys | `handlers/management/config_lists.go`: GET/PATCH/DELETE remain compatible; append still uses `old == new`, deletion uses `value`. Checked through source and synthetic client requests, without changing cloud keys. |
-| Provider quota parsers | Existing Codex, Claude, Antigravity, Kimi, and Grok request/response fixtures pass. Provider-hosted quota APIs are separate from CPA's management contract; their live availability and returned shapes were not verified against real accounts. |
+| Management access | `/v0/management` paths and bearer management authentication remain compatible; reviewed `internal/api/server_management.go` and management handlers. |
+| Account list | `auth_files.go` adds `observed_at` and `cooldowns`. Pagination is opt-in via `page`/`page_size`; clients continue requesting the complete list without pagination parameters. Identity remains the backend `id` with `auth_index`. |
+| Runtime state | `sdk/cliproxy/auth/cooldown_view.go` defines retry restrictions, not overall availability. The list handler reconciles account status with active credential/model gates. Home/disk-only state can return null cooldowns. |
+| Account models | `GetAuthFileModels` still returns registered model IDs and optional display/type/owner metadata. Model lookup uses the backend account ID in `name`; credential-file download uses the filename. Missing runtime status stays unknown. |
+| Quota proxy | `api_tools.go` preserves string `data`, nested `status_code`, and string response `body`. `$TOKEN$` remains server-resolved; missing credentials/tokens now fail explicitly with HTTP 400. Existing error handling accepts that failure. |
+| Config/model inventory | Existing OpenAI-compatible, Codex, Claude, Gemini, Interactions, and Vertex GET contracts remain compatible. `service_models.go` and config types preserve current alias/exclusion/prefix rules. New internal catalog capabilities do not justify inventing runtime model availability. |
+| Routing and API keys | OAuth aliases/exclusions, strategy, force-prefix, file routing metadata, and GET/PATCH/DELETE key contracts remain compatible. No cloud mutations were performed. |
+| macOS OAuth | Existing Codex/Claude/Antigravity callback and xAI/Kimi device flows remain supported. `/kimi-auth-url` retains the default Kimi coding flow; the new Kimi.ai route is separate. |
 
-## Deliberate scope limits
+No new Meta, Devin, Kimi.ai, plugin/Home, discovery, quota-reset, or credential-refresh controls were added. Existing provider quota fixtures remain the validation source; live provider APIs and production credentials were not exercised.
 
-- No new xAI API-key channel, plugin/Home controls, session/harness features, request-retry controls, OAuth flows on iOS, or other upstream feature additions.
-- No cloud configuration changes, real OAuth login, real credential/key mutation, production quota requests, or deployment changes.
-- A local source/build check does not establish cloud connectivity, physical-device behavior, signed distribution, or successful provider quota retrieval.
+## macOS delivery
 
-## macOS record
-
-- Client starting revision: `862ec7eef05076eecca186445db06e80df1a05a1` (`v1.3.0`, 2026-07-12).
-- The explicit-model exclusion bug previously left blocked models in the model pool and routing view. Default-model capability metadata was also discarded during synthesis; both are fixed.
-- Existing native OAuth URL, device-flow metadata, callback relay, status polling, and API-key contracts remain unchanged.
-- The JXA fallback's management paths and envelope fields were inspected. It remains a legacy quota monitor with a smaller feature set; native quota-provider parity and live JXA behavior were not certified by this audit.
+- Client starting revision: `7014cd34bf5ed1136ce4736269634b3146176353` (`v1.3.1`).
+- Added native application updates from `gaojunbin/CPA_macos` GitHub Releases, enabled by default with a six-hour check interval and manual controls.
+- Downloads require the release asset SHA-256 digest and size. Installation verifies version, identity, signature, OS, architecture, and updater metadata; Developer ID installations also require the same signing team.
+- Installation waits for the popover and editing/login/key screens to be inactive. The helper waits for CPA to exit, preserves the old bundle, relaunches the replacement, and requires a startup receipt. Replacement/startup failure restores the old bundle.
+- Native packaging defaults to arm64/x86_64 and includes the helper. The default application version is `1.4.0`, build `8`; explicit release versions are embedded into the bundle and checked against artifact names.
+- Existing installations through 1.3.1 require one manual installation to gain this feature. Release publication is tracked by the tagged commit, GitHub Actions run, and GitHub Release assets; it does not replace the user's installed CPA.
 
 ## Validation
 
-Run from `CPA_macos`:
+Run from `CPA_macos` with full Xcode:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer swift test --scratch-path /tmp/cpa-macos-validation
-DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer swift build -c release --product CPAStatusBar --scratch-path /tmp/cpa-macos-validation
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer DIST_DIR=/tmp/cpa-macos-package BUILD_DIR=/tmp/cpa-macos-release OUTPUT_DIR=/tmp/cpa-macos-package/github Scripts/package_github_release.sh
 git diff --check
 ```
 
-- 52 XCTest cases passed, including shared-filename account model lookups, current config contracts, full/partial exclusions, duplicate aliases, metadata preservation, keyless credentials, backend errors, and passive quota observations.
-- Native `CPAStatusBar` Release build passed. Binary output: `/tmp/cpa-macos-validation/release/CPAStatusBar`.
-- No live menu-bar/cloud acceptance or installer/release packaging was performed.
+- 62 XCTest cases passed, including scoped/null/empty/expired cooldowns, stable version selection, draft/prerelease/downgrade rejection, foreign or unverified assets, checksum mismatch, HTTP failure, path traversal, replacement, and rollback.
+- The final test run used `--disable-sandbox --cache-path /tmp/cpa-swift-cache --config-path /tmp/cpa-swift-config --security-path /tmp/cpa-swift-security` and `CLANG_MODULE_CACHE_PATH=/tmp/cpa-swift-module-cache` because nested SwiftPM sandbox setup and home-directory caches were restricted in the task environment. The outer filesystem restrictions remained in force.
+- Universal native Release build and packaging passed. ZIP and DMG SHA-256 checks, `hdiutil verify`, `codesign --verify --deep --strict`, both executable architectures, and macOS 13 minimum metadata passed. Artifacts are under `/tmp/cpa-macos-package/github/`.
+- A temporary client fetched GitHub's actual latest release (1.3.1) and downloaded its ZIP through `AppUpdateClient`; size and SHA-256 verification passed. It did not install that older release.
+- An isolated signed fixture passed the production unpack/identity/version/signature/OS/architecture checks. The production helper completed readiness, parent-exit handling, and replacement. LaunchServices returned `kLSNoExecutableErr`; the helper restored the old bundle and cleaned staging. Successful LaunchServices relaunch/startup receipt remains unverified in this environment; the success transaction is covered by a unit test.
+- The local validation above does not establish live cloud/menu-bar acceptance, Developer ID signing, notarization, or an actual installed-client update. Release publication and downloaded-asset verification are separate distribution evidence.
 
 ## Next sync
 
-Read `AGENTS.md`, then compare `7fac6b15bcfe5ea55c18c9eaec8e5b7e6457d974..HEAD` in the read-only upstream checkout, focusing on the sources above. Replace this baseline only after rechecking existing contracts and rerunning relevant client validation. Record the actual cloud revision separately if it is inspected.
+Compare `a5ab69521f7b4e0f244836d0419da8fcd89408ea..HEAD` in the upstream reference. Recheck these contracts, update both clients where behavior is shared, and record actual cloud/distribution acceptance separately.

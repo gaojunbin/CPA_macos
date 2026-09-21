@@ -33,7 +33,7 @@ jobs:
 
       - name: Build release artifacts
         env:
-          VERSION: ${{ inputs.version || github.ref_name }}
+          VERSION: ${{ inputs.version || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
           APP_VARIANT: ${{ inputs.app_variant || 'native' }}
         run: Scripts/package_github_release.sh
 

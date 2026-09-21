@@ -122,24 +122,42 @@ open "dist/CPA.app"
 
 The app runs as a menu bar accessory. On macOS 26 it uses native Liquid Glass cards (`NSGlassEffectView`); macOS 13–15 use a vibrancy fallback. Alongside monitoring, it can re-authorize accounts via OAuth, inspect upstream routing, and manage API keys for the connected service (see **Account & key management** above).
 
+## Automatic application updates
+
+The native application checks the public GitHub Releases API for `gaojunbin/CPA_macos` on launch when a check is due, then every six hours. Automatic checking and installation are enabled by default. Open **•••** or **Manage services > Software update** to check manually, view progress, or turn automatic updates off. Update requests use a separate session and never include service management credentials.
+
+A newer stable release is downloaded and verified in the background. Installation waits until the popover is closed and no service editor, OAuth login, or API key screen is active. CPA then exits, replaces its bundle, and relaunches. The installer keeps the previous bundle until the new application acknowledges startup, and restores it if replacement or startup fails. Service profiles and Keychain credentials remain in their existing stores.
+
+Update eligibility requires:
+
+- A stable three-part version such as `v1.4.1`, greater than the installed version; drafts, prereleases, and downgrades are ignored.
+- A `CPA-<version>-macOS.zip` asset in that release, with GitHub's SHA-256 `digest` and matching download size.
+- Matching bundle identity and embedded version, a valid code signature, the same Developer ID team when the installed app has one, a supported macOS minimum, and the current CPU architecture.
+- A native bundle containing the update helper and `CPAUpdateProtocol` metadata, produced by the current packaging script.
+- A writable installed `.app` and parent directory. Disk images, App Translocation, source execution, and read-only installations cannot be replaced automatically. Use `/Applications` or `~/Applications` with write access.
+
+GitHub HTTPS and the release asset digest authenticate the repository's download; the default ad-hoc signature verifies bundle integrity, not an independent publisher identity. Developer ID signing and notarization remain separate release steps. The updater does not remove quarantine attributes or request administrator privileges.
+
+Existing versions through 1.3.1 do not contain the updater. Install the first updater-enabled release manually once; subsequent compatible releases can update automatically. The legacy JXA app is outside this update channel.
+
 ## Package for GitHub Releases
 
 Create installable GitHub Release assets:
 
 ```bash
-VERSION=1.0.0 Scripts/package_github_release.sh
+VERSION=1.4.0 Scripts/package_github_release.sh
 ```
 
 The release files are written to `dist/github/`:
 
-- `CPA-1.0.0-macOS.dmg` for drag-to-Applications installation
-- `CPA-1.0.0-macOS.zip` as a fallback app bundle archive
-- `CPA-1.0.0-macOS-SHA256.txt` for checksum verification
+- `CPA-1.4.0-macOS.dmg` for drag-to-Applications installation
+- `CPA-1.4.0-macOS.zip` as a fallback app bundle archive
+- `CPA-1.4.0-macOS-SHA256.txt` for checksum verification
 
-By default the package script uses the native Swift/AppKit bundle, matching `Scripts/build_app.sh`. To package the JXA fallback bundle instead:
+By default the package script builds universal arm64/x86_64 native bundles, including the installer helper. `VERSION` sets both the embedded app version and release filenames; a mismatch fails packaging. Build intermediates use `/tmp/cpa-macos-build`. Set `BUILD_DIR`, `DIST_DIR`, or `OUTPUT_DIR` to redirect outputs; set `ARCHS=arm64` for a local architecture-only build. To package the JXA fallback bundle instead:
 
 ```bash
-APP_VARIANT=jxa VERSION=1.0.0 Scripts/package_github_release.sh
+APP_VARIANT=jxa VERSION=1.4.0 Scripts/package_github_release.sh
 ```
 
 Pushing a tag like `v1.0.0` runs the Release workflow and uploads the same assets to the GitHub Release.

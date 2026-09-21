@@ -8,6 +8,38 @@ final class UpstreamCompatibilityTests: XCTestCase {
         }
     }
 
+    func testCurrentCooldownSnapshotsPreserveScopeAndUnknownState() throws {
+        let model: [String: Any] = ["scope": "model", "model_key": "gpt-5", "reason": "quota",
+                                    "retry_at": "2099-01-01T00:00:00.123456789Z", "remaining_seconds": 20]
+        let partial = AccountDetail(dict: ["cooldowns": [model], "quota": ["signals": ["used": "100"]]])
+        XCTAssertEqual(partial.activeModelCooldowns.map(\.model), ["gpt-5"])
+        XCTAssertEqual(partial.modelRuntimeStates["gpt-5"]?.statusMessage, "模型额度冷却")
+        XCTAssertNotNil(partial.nextRecoveryDate)
+        XCTAssertFalse(partial.quotaExceeded)
+        let auth = AuthFile(id: "test", name: "test.json", provider: "codex", status: "active")
+        XCTAssertTrue(AccountQuota(auth: auth, usage: nil, errorMessage: nil, detail: partial).isHealthy)
+
+        var credential = model
+        credential["scope"] = "credential"
+        credential["reason"] = "credential_quota"
+        let blocked = AccountDetail(dict: ["cooldowns": [credential]])
+        XCTAssertTrue(blocked.activeModelCooldowns.isEmpty)
+        XCTAssertTrue(AccountQuota(auth: auth, usage: nil, errorMessage: nil, detail: blocked).isUnavailable)
+        XCTAssertNil(AccountDetail(dict: [:]).cooldowns)
+        XCTAssertNil(AccountDetail(dict: ["cooldowns": NSNull()]).cooldowns)
+        XCTAssertEqual(AccountDetail(dict: ["cooldowns": []]).cooldowns, [])
+
+        var expired = model
+        expired["retry_at"] = "2000-01-01T00:00:00Z"
+        let cleared = AccountDetail(dict: ["cooldowns": [expired], "model_states": ["stale": ["unavailable": true]]])
+        XCTAssertTrue(cleared.activeModelCooldowns.isEmpty)
+        XCTAssertNil(cleared.nextRecoveryDate)
+        XCTAssertTrue(cleared.modelRuntimeStates.isEmpty)
+        var invalid = model
+        invalid["retry_at"] = "invalid"
+        XCTAssertTrue(AccountDetail(dict: ["cooldowns": [invalid]]).activeCooldowns.isEmpty)
+    }
+
     func testRuntimeErrorsAreNotHealthyAndPassiveQuotaIsNotCooldown() throws {
         let data = Data(#"{"files":[{"id":"account","name":"account.json","provider":"codex","auth_index":"index","status":"error","disabled":false,"unavailable":false,"quota":{"observed_at":"2026-09-09T00:00:00Z","signals":{"X-Codex-Primary-Used-Percent":"100"}}}]}"#.utf8)
         let auth = try XCTUnwrap(JSONDecoder().decode(AuthFilesResponse.self, from: data).files.first)
@@ -20,7 +52,7 @@ final class UpstreamCompatibilityTests: XCTestCase {
 }
 
 private func validateConfiguredModels(_ check: (Bool, String) throws -> Void) throws {
-    // Fixture shapes follow CLIProxyAPI v7.2.155 config handlers and model registration.
+    // Fixture shapes follow CLIProxyAPI v7.3.10 config handlers and model registration.
     for kind in APIKeyChannelKind.allCases {
         let root: [String: Any] = [kind.rawValue: [[
             "api-key": "",
