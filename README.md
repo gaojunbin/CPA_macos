@@ -167,3 +167,15 @@ APP_VARIANT=jxa VERSION=1.5.0 Scripts/package_github_release.sh
 Pushing a tag like `v1.0.0` runs the Release workflow and uploads the same assets to the GitHub Release.
 
 The local package is ad-hoc signed by default. For public distribution without Gatekeeper warnings, build with a Developer ID signing identity and notarize the release with Apple.
+
+## App icon
+
+The monochrome Confluence mark represents multiple upstream channels converging into one managed endpoint. The artwork uses pure black and white, a consistent rounded stroke, and a generous safe area. The editable SVG is the only drawing source; platform exports are rendered directly at each required size.
+
+Regenerate the checked-in icon assets from this repository:
+
+```sh
+swift Scripts/generate_app_icon.swift
+```
+
+The macOS master is `Resources/AppIcon.svg`. The script exports `Resources/AppIcon.icns` with all 16–1024 px representations. The background has an inset rounded silhouette with transparent outer padding.
