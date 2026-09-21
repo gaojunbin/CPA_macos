@@ -46,6 +46,7 @@ No new Meta, Devin, Kimi.ai, plugin/Home, discovery, quota-reset, or credential-
 - Downloads require the release asset SHA-256 digest and size. Installation verifies version, identity, signature, OS, architecture, and updater metadata; Developer ID installations also require the same signing team.
 - Installation waits for the popover and editing/login/key screens to be inactive. The helper waits for CPA to exit, preserves the old bundle, relaunches the replacement, and requires a startup receipt. Replacement/startup failure restores the old bundle.
 - Native packaging defaults to arm64/x86_64 and includes the helper. The default application version is `1.4.0`, build `8`; explicit release versions are embedded into the bundle and checked against artifact names.
+- Executable entry files use their type names instead of `main.swift`, so Xcode 26's universal-build backend recognizes `@main` without treating the files as top-level scripts. Packaging preserves compiler diagnostics.
 - Existing installations through 1.3.1 require one manual installation to gain this feature. Release publication is tracked by the tagged commit, GitHub Actions run, and GitHub Release assets; it does not replace the user's installed CPA.
 
 ## Validation

@@ -29,7 +29,7 @@ Native macOS menu bar client (Swift Package Manager, Swift 5 language mode, macO
 - `Sources/CPAStatusCore/CLIProxyAPIClient.swift`: management networking, live quota requests, model/routing reads, OAuth and API key management.
 - `Models.swift`, `UsageParser.swift`, `DashboardMetrics.swift`: account/model decoding, provider quota interpretation, and health summaries.
 - `ConfigChannels.swift`, `ConfiguredModelMetadata.swift`, `RoutingModels.swift`: config models and routing metadata. Preserve metadata when generating prefixed model IDs.
-- `Sources/CPAStatusBar/main.swift`: AppKit dashboard, details, model pool, routing, service settings, OAuth, and API key UI.
+- `Sources/CPAStatusBar/CPAStatusBarMain.swift`: AppKit dashboard, details, model pool, routing, service settings, OAuth, and API key UI.
 - `Tests/CPAStatusCoreTests/`: persistent unit and request-contract regression tests.
 - `JXA/CPAQuotaBar.jxa`: legacy lightweight fallback; it does not have native feature parity. Do not expand it as part of native maintenance.
 
