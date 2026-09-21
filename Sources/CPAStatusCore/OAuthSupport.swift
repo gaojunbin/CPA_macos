@@ -17,6 +17,9 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
     case antigravity
     case xai
     case kimi
+    case devin
+    case meta
+    case kimiAI = "kimi-ai"
 
     public var displayName: String {
         switch self {
@@ -25,6 +28,9 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
         case .antigravity: return "Antigravity"
         case .xai: return "Grok"
         case .kimi: return "Kimi"
+        case .devin: return "Devin"
+        case .meta: return "Meta"
+        case .kimiAI: return "Kimi.ai"
         }
     }
 
@@ -36,6 +42,9 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
         case .antigravity: return "/v0/management/antigravity-auth-url"
         case .xai: return "/v0/management/xai-auth-url"
         case .kimi: return "/v0/management/kimi-auth-url"
+        case .devin: return "/v0/management/devin-auth-url"
+        case .meta: return "/v0/management/meta-auth-url"
+        case .kimiAI: return "/v0/management/kimi-ai-auth-url"
         }
     }
 
@@ -47,24 +56,33 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
         case .antigravity: return "antigravity"
         case .xai: return "xai"
         case .kimi: return "kimi"
+        case .devin: return "devin"
+        case .meta: return "meta"
+        case .kimiAI: return "kimi-ai"
         }
     }
 
     /// Loopback port the upstream OAuth app redirects to, matching the hardcoded redirect URIs
-    /// in CLIProxyAPI's auth packages. `nil` means the provider uses a device flow (no redirect).
+    /// in CLIProxyAPI's auth packages. Devin uses the server-configured port instead.
     public var callbackPort: UInt16? {
         switch self {
         case .codex: return 1455          // http://localhost:1455/auth/callback
         case .claude: return 54545        // http://localhost:54545/callback
         case .antigravity: return 51121   // http://localhost:51121/oauth-callback
         case .xai: return nil             // RFC 8628 device flow in current CLIProxyAPI
-        case .kimi: return nil            // device flow
+        case .kimi, .kimiAI, .meta: return nil
+        case .devin: return nil           // Dynamic server port; still an authorization-code flow.
         }
     }
 
     /// Device-flow providers only need the user to authorize in a browser; the server polls
     /// the upstream token endpoint, so the client never captures a redirect.
-    public var usesDeviceFlow: Bool { callbackPort == nil }
+    public var usesDeviceFlow: Bool {
+        switch self {
+        case .xai, .kimi, .kimiAI, .meta: return true
+        default: return false
+        }
+    }
 
     /// Key into `ProviderCatalog` so the OAuth UI can reuse the same icon/accent as the dashboard.
     public var catalogKey: String { rawValue }
@@ -123,4 +141,15 @@ public enum OAuthError: LocalizedError, Sendable {
             return message
         }
     }
+}
+
+/// Reject another attempt's callback before the server can associate it with this session.
+public func validateOAuthCallback(_ redirectURL: String, state: String) throws {
+    guard !state.isEmpty,
+          let url = URLComponents(string: redirectURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+          url.scheme == "http", ["localhost", "127.0.0.1", "::1"].contains(url.host ?? ""),
+          url.queryItems?.filter({ $0.name == "state" }).count == 1,
+          url.queryItems?.first(where: { $0.name == "state" })?.value == state,
+          url.queryItems?.contains(where: { ($0.name == "code" || $0.name == "error") && !($0.value ?? "").isEmpty }) == true
+    else { throw OAuthError.invalidCallback }
 }

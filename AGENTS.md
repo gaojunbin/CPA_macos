@@ -6,7 +6,7 @@ Native macOS menu bar client (Swift Package Manager, Swift 5 language mode, macO
 
 - This is a native client for remotely deployed CLIProxyAPI. Do not add Docker or embed the proxy server.
 - Treat `../CLIProxyAPI` as a read-only upstream reference: do not edit, fetch, pull, checkout, or build into that directory during client compatibility work.
-- Compatibility maintenance preserves existing features and displayed information. Do not add upstream features or providers unless explicitly requested.
+- Compatibility sync includes current upstream built-in provider additions, their account/model information, and native authorization flows. Keep quota semantics aligned with upstream; do not invent availability or expand into unrelated plugin/Home administration.
 - Communicate with the user in Chinese. Write code, comments, documentation, branches, and commit messages in English. Preserve the existing Chinese product UI.
 - Keep functions focused and use the existing directory structure. Do not introduce version-suffixed replacements or commented-out code.
 - Keep temporary scripts, build output, and logs under `/tmp`; do not commit one-off validation scripts.

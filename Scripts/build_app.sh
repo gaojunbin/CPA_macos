@@ -8,7 +8,7 @@ BUILD_CONFIG="${BUILD_CONFIG:-release}"
 ICON_FILE="$ROOT_DIR/Resources/AppIcon.icns"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 BUILD_DIR="${BUILD_DIR:-/tmp/cpa-macos-build}"
-APP_VERSION="${VERSION:-1.4.0}"
+APP_VERSION="${VERSION:-1.5.0}"
 APP_VERSION="${APP_VERSION#v}"
 if [[ ! "$APP_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "Expected a stable semantic version, got: $APP_VERSION" >&2
@@ -60,7 +60,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key>
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>8</string>
+  <string>9</string>
   <key>CPAUpdateProtocol</key>
   <integer>1</integer>
   <key>LSMinimumSystemVersion</key>

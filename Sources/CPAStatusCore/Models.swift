@@ -72,7 +72,11 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
     }
 
     public var isKimi: Bool {
-        normalizedProvider == "kimi"
+        normalizedProvider == "kimi" || normalizedProvider == "kimi-ai"
+    }
+
+    public var isDevin: Bool {
+        normalizedProvider == "devin" || normalizedProvider == "cognition"
     }
 
     public var isXAI: Bool {
@@ -260,6 +264,7 @@ public struct UsageSnapshot: Equatable, Sendable {
     public let additionalWindows: [QuotaWindow]
     public let rawStatus: String?
     public let fetchedAt: Date
+    public let observation: QuotaObservation
 
     public init(
         planType: String?,
@@ -267,7 +272,8 @@ public struct UsageSnapshot: Equatable, Sendable {
         weekly: QuotaWindow?,
         additionalWindows: [QuotaWindow] = [],
         rawStatus: String?,
-        fetchedAt: Date = Date()
+        fetchedAt: Date = Date(),
+        observation: QuotaObservation = .live
     ) {
         self.planType = planType
         self.primary = primary
@@ -275,6 +281,7 @@ public struct UsageSnapshot: Equatable, Sendable {
         self.additionalWindows = additionalWindows
         self.rawStatus = rawStatus
         self.fetchedAt = fetchedAt
+        self.observation = observation
     }
 
     public var hasQuotaSignal: Bool {
@@ -303,7 +310,7 @@ public struct AccountQuota: Identifiable, Equatable, Sendable {
     ) {
         self.id = auth.id
         self.auth = auth
-        self.usage = usage
+        self.usage = usage ?? (auth.isDevin ? detail?.devinQuota?.usage() : nil)
         self.errorMessage = errorMessage
         self.detail = detail
         self.configModels = configModels
@@ -388,6 +395,7 @@ public struct AccountCredits: Equatable, Sendable {
 /// Rich per-account runtime data parsed from a single `/v0/management/auth-files` list entry.
 /// Mirrors the fields the iOS detail screen surfaces, parsed leniently from raw JSON.
 public struct AccountDetail: Equatable, Sendable {
+    public let devinQuota: DevinQuota?
     public let cooldowns: [AccountCooldown]?
     public let success: Int
     public let failed: Int
@@ -448,6 +456,8 @@ public struct AccountDetail: Equatable, Sendable {
         }
         modelStates = states
         let quota = firstDictionary(dict["quota"])
+        devinQuota = quota.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+            .flatMap { try? JSONDecoder().decode(DevinQuota.self, from: $0) }
         quotaExceeded = boolValue(quota?["exceeded"]) ?? false
         quotaReason = accountDetailErrorText(quota?["reason"])
         nextRecoverAt = dateValue(firstValue(quota?["next_recover_at"], quota?["nextRecoverAt"]), now: now)
@@ -1051,6 +1061,11 @@ public enum ProviderCatalog {
         "antigravity": ProviderInfo(key: "antigravity", displayName: "Antigravity", symbolName: "paperplane.fill", accentName: "purple", priority: 6, supportsUsage: true),
         "xai": ProviderInfo(key: "xai", displayName: "Grok", symbolName: "x.circle.fill", accentName: "gray", priority: 7, supportsUsage: true),
         "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: true),
+        "devin": ProviderInfo(key: "devin", displayName: "Devin", symbolName: "d.circle.fill", accentName: "blue", priority: 9, supportsUsage: true),
+        "meta": ProviderInfo(key: "meta", displayName: "Meta", symbolName: "infinity", accentName: "blue", priority: 10, supportsUsage: false),
+        "kimi-ai": ProviderInfo(key: "kimi-ai", displayName: "Kimi.ai", symbolName: "k.circle", accentName: "pink", priority: 11, supportsUsage: true),
+        "xai-api-key": ProviderInfo(key: "xai-api-key", displayName: "Grok API Key", symbolName: "key.fill", accentName: "gray", priority: 46, supportsUsage: false),
+        "meta-api-key": ProviderInfo(key: "meta-api-key", displayName: "Meta API Key", symbolName: "key.fill", accentName: "blue", priority: 45, supportsUsage: false),
         // Config-based API-key channels (config.yaml sections, not OAuth accounts).
         "codex-api-key": ProviderInfo(key: "codex-api-key", displayName: "Codex API Key", symbolName: "key.fill", accentName: "teal", priority: 40, supportsUsage: false),
         "claude-api-key": ProviderInfo(key: "claude-api-key", displayName: "Claude API Key", symbolName: "key.fill", accentName: "orange", priority: 41, supportsUsage: false),
@@ -1093,6 +1108,7 @@ public enum ProviderCatalog {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "_", with: "-")
+        if normalized == "cognition" { return "devin" }
         if normalized == "x-ai" || normalized == "grok" {
             return "xai"
         }

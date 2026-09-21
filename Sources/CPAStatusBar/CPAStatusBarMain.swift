@@ -1813,6 +1813,8 @@ final class PopoverViewController: NSViewController {
                 ("Gemini", .antigravityGeminiFiveHour, "5h", .antigravityGeminiSevenDay, "7d"),
                 ("Claude/GPT", .antigravityClaudeGPTFiveHour, "5h", .antigravityClaudeGPTSevenDay, "7d")
             ]
+        case "devin":
+            pairs = [("池平均", .devinDaily, "日", .devinWeekly, "周")]
         case "xai":
             pairs = [("池平均", .xaiWeekly, "周", .xaiMonthly, "月")]
         default:
@@ -2427,7 +2429,10 @@ final class PopoverViewController: NSViewController {
             let client = CLIProxyAPIClient(settings: settings)
             do {
                 let auth = try await client.requestOAuthURL(for: provider)
-                guard self.isCurrentOAuth(generation) else { return }
+                guard self.isCurrentOAuth(generation) else {
+                    try? await client.cancelOAuthSession(state: auth.state)
+                    return
+                }
                 let usesDeviceFlow = auth.isDeviceFlow || provider.usesDeviceFlow
                 self.state.oauth?.authURL = auth.url
                 self.state.oauth?.sessionState = auth.state
@@ -2521,6 +2526,7 @@ final class PopoverViewController: NSViewController {
 
     private func succeedOAuth() {
         let name = state.oauth?.provider.displayName ?? ""
+        state.oauth?.sessionState = nil
         cleanupOAuthResources()
         state.oauth = nil
         onHoldOpen?(false)
@@ -2548,6 +2554,10 @@ final class PopoverViewController: NSViewController {
     }
 
     private func cleanupOAuthResources() {
+        if let sessionState = state.oauth?.sessionState, !sessionState.isEmpty {
+            let client = CLIProxyAPIClient(settings: state.settings)
+            Task { try? await client.cancelOAuthSession(state: sessionState) }
+        }
         oauthTask?.cancel()
         oauthTask = nil
     }
@@ -3367,7 +3377,7 @@ final class PopoverViewController: NSViewController {
     }
 
     private func detailQuotaCard(_ account: AccountQuota) -> NSView {
-        detailSectionCard(title: "实时剩余额度", symbol: "gauge.with.dots.needle.50percent") { stack in
+        detailSectionCard(title: account.auth.isDevin ? "Devin 额度" : "实时剩余额度", symbol: "gauge.with.dots.needle.50percent") { stack in
             if let error = account.errorMessage, !error.isEmpty {
                 let note = noteLabel(text: trimError(error), color: .systemRed)
                 stack.addArrangedSubview(note)
@@ -3385,13 +3395,16 @@ final class PopoverViewController: NSViewController {
                 } else if account.configModels != nil {
                     text = "配置渠道（config.yaml），无实时额度信息"
                 } else {
-                    text = "该来源仅显示身份状态"
+                    text = account.auth.isDevin ? "暂无有效额度观测，请刷新" : "该来源仅显示身份状态"
                 }
                 let note = noteLabel(text: text)
                 stack.addArrangedSubview(note)
                 note.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             }
-            if let date = account.usage?.fetchedAt {
+            if case let .server(date) = account.usage?.observation {
+                let text = date.map { "服务端观测于 \(absoluteTime($0))" } ?? "服务端未提供额度观测时间"
+                stack.addArrangedSubview(noteLabel(text: text))
+            } else if let date = account.usage?.fetchedAt {
                 stack.addArrangedSubview(label("同步于 \(relativeShort(date))", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor))
             }
         }

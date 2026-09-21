@@ -2,7 +2,7 @@
 
 Compatibility baseline and audit evidence: [CPA_SYNC.md](CPA_SYNC.md). Contributor instructions: [AGENTS.md](AGENTS.md).
 
-Native macOS menu bar monitor for CLIProxyAPI OAuth pools, upstream balances, and model routing across Codex/OpenAI, Claude, Antigravity, Grok/xAI, Kimi, and config-based providers.
+Native macOS menu bar monitor for CLIProxyAPI OAuth pools, upstream balances, and model routing across Codex/OpenAI, Claude, Antigravity, Grok/xAI, Kimi, Kimi.ai, Devin, Meta, and config-based providers.
 
 It reads the management API with the configured password, then refreshes each Codex account through:
 
@@ -34,7 +34,7 @@ The management password is stored in macOS Keychain. You can add more services a
 
 ## Config-based channels on the dashboard (配置渠道)
 
-Channels defined in the server's `config.yaml` — `openai-compatibility` providers (e.g. an "opencode" entry) and the `claude/codex/gemini/interactions/vertex-api-key` sections — are not OAuth accounts and never appear in the server's auth-files list, so earlier versions could not show them. The dashboard now lists each of them as its own provider section (tagged 配置渠道), with one row per configured API key (masked). Opening a row shows the channel's models (resolved from config), its base URL, and the config source; these credentials have no live quota, so no usage bars are shown.
+Channels defined in the server's `config.yaml` — `openai-compatibility` providers (e.g. an "opencode" entry) and the `claude/codex/gemini/interactions/vertex/xai/meta-api-key` sections — are not OAuth accounts and never appear in the server's auth-files list, so earlier versions could not show them. The dashboard now lists each of them as its own provider section (tagged 配置渠道), with one row per configured API key (masked). Opening a row shows the channel's models (resolved from config), its base URL, and the config source; these credentials have no live quota, so no usage bars are shown.
 
 ## Multiple services
 
@@ -59,13 +59,17 @@ Open an account's detail screen, then click the account name at the top (or the 
 When an account drops its login, re-authorize it without opening the web UI. The flow is browser-independent: copy the authorization link, then either paste the loopback callback or finish the provider's device flow, so you can log in with **any browser**, not just the system default:
 
 1. On the dashboard, click the **•••** button → **添加账号（OAuth 登录）**.
-2. Pick a provider (Codex, Claude, Antigravity, Grok, or Kimi).
+2. Pick a provider (Codex, Claude, Antigravity, Grok, Kimi, Kimi.ai, Devin, or Meta).
 3. **复制授权链接**, open it in whichever browser you like, and log in.
-4. For Codex / Claude / Antigravity: after login the browser is redirected to a `http://localhost:<port>/…` address (the page will look like it failed to load — that's expected). **Copy that whole address from the address bar, paste it into the app, and click 提交.** Grok/xAI and Kimi use device flows — authorize in the browser and the app detects completion automatically.
+4. For Codex / Claude / Antigravity / Devin: after login the browser is redirected to a `http://localhost:<port>/…` address (the page will look like it failed to load — that's expected). **Copy that whole address from the address bar, paste it into the app, and click 提交.** Grok/xAI, Kimi, Kimi.ai, and Meta use device flows — authorize in the browser and the app detects completion automatically.
 
 How it works: the app requests the auth URL (`/v0/management/<provider>-auth-url`) and polls `/v0/management/get-auth-status` until done. Redirect-based providers also send your pasted URL to `/v0/management/oauth-callback`; device-flow providers need no callback. The server performs the token exchange, so the app never handles account tokens. The popover stays open while you switch to the browser and back.
 
 > The loopback callback URL works even when CLIProxyAPI runs on a remote VPS — you're only relaying the URL the provider handed your browser, and the server completes the exchange.
+
+Devin uses `http://127.0.0.1:<server-port>/callback`, so retain the actual callback URL instead of assuming a fixed port. Callbacks must match the current login state; closing or restarting authorization cancels the pending server session.
+
+Devin quota refresh targets one credential through `/v0/management/auth-files/refresh`. The client retains only the returned quota observation: plan, daily/weekly remaining percentages, reset times, and the server observation timestamp. Missing, invalid, and expired windows stay unknown. Zero quota does not invent a scheduler cooldown. Meta accounts expose identity and models without claiming an unsupported live-quota endpoint. Kimi.ai uses its own coding API host.
 
 ### API key management (API 密钥)
 
@@ -82,7 +86,7 @@ Keys are shown masked; copying always copies the full value.
 Click **•••** → **模型列表…** to see every model the current service can actually serve right now — the menu bar equivalent of the proxy's `/v1/models`, but fetched with just the management key (no inference API key needed).
 
 - Models are grouped by provider (Codex, Claude, Gemini, …) and deduplicated across that provider's accounts.
-- Config-based channels are included too: each `openai-compatibility` provider appears under its own name (e.g. `opencode`) with its model aliases, and `claude/codex/gemini/interactions/vertex-api-key` sections appear as "… API Key" groups (tagged 配置渠道).
+- Config-based channels are included too: each `openai-compatibility` provider appears under its own name (e.g. `opencode`) with its model aliases, and `claude/codex/gemini/interactions/vertex/xai/meta-api-key` sections appear as "… API Key" groups (tagged 配置渠道).
 - The header shows the distinct model count and how many accounts were aggregated.
 - Type in the search field to filter by model ID, display name, owner, or provider name.
 - Click any model row to copy its model ID — handy when configuring clients that talk to the proxy.
@@ -145,19 +149,19 @@ Existing versions through 1.3.1 do not contain the updater. Install the first up
 Create installable GitHub Release assets:
 
 ```bash
-VERSION=1.4.0 Scripts/package_github_release.sh
+VERSION=1.5.0 Scripts/package_github_release.sh
 ```
 
 The release files are written to `dist/github/`:
 
-- `CPA-1.4.0-macOS.dmg` for drag-to-Applications installation
-- `CPA-1.4.0-macOS.zip` as a fallback app bundle archive
-- `CPA-1.4.0-macOS-SHA256.txt` for checksum verification
+- `CPA-1.5.0-macOS.dmg` for drag-to-Applications installation
+- `CPA-1.5.0-macOS.zip` as a fallback app bundle archive
+- `CPA-1.5.0-macOS-SHA256.txt` for checksum verification
 
 By default the package script builds universal arm64/x86_64 native bundles, including the installer helper. `VERSION` sets both the embedded app version and release filenames; a mismatch fails packaging. Build intermediates use `/tmp/cpa-macos-build`. Set `BUILD_DIR`, `DIST_DIR`, or `OUTPUT_DIR` to redirect outputs; set `ARCHS=arm64` for a local architecture-only build. To package the JXA fallback bundle instead:
 
 ```bash
-APP_VARIANT=jxa VERSION=1.4.0 Scripts/package_github_release.sh
+APP_VARIANT=jxa VERSION=1.5.0 Scripts/package_github_release.sh
 ```
 
 Pushing a tag like `v1.0.0` runs the Release workflow and uploads the same assets to the GitHub Release.

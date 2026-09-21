@@ -638,11 +638,14 @@ public struct CLIProxyAPIClient: Sendable {
             let usage = try await fetchUsage(auth: auth)
             return AccountQuota(auth: auth, usage: usage, errorMessage: nil, detail: detail)
         } catch {
-            return AccountQuota(auth: auth, usage: nil, errorMessage: error.localizedDescription, detail: detail)
+            return AccountQuota(auth: auth, usage: auth.isDevin ? detail?.devinQuota?.usage() : nil, errorMessage: error.localizedDescription, detail: detail)
         }
     }
 
     private func fetchUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        if auth.isDevin {
+            return try await fetchDevinUsage(auth: auth)
+        }
         if auth.isAntigravity {
             return try await fetchAntigravityUsage(auth: auth)
         }
@@ -881,11 +884,24 @@ public struct CLIProxyAPIClient: Sendable {
         throw PoolClientError.invalidResponse("empty Claude quota")
     }
 
+    private func fetchDevinUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/refresh")
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "POST"
+        applyManagementHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["name": auth.name, "auth_index": auth.authIndex])
+        let response = try JSONDecoder().decode(DevinRefreshResponse.self, from: await data(for: request))
+        guard response.ok else { throw PoolClientError.invalidResponse("Devin refresh did not complete") }
+        return response.auth.quota.usage()
+    }
+
     private func fetchKimiUsage(auth: AuthFile) async throws -> UsageSnapshot {
         let payload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
-            url: "https://api.kimi.com/coding/v1/usages",
+            url: auth.normalizedProvider == "kimi-ai"
+                ? "https://api.kimi.ai/coding/v1/usages" : "https://api.kimi.com/coding/v1/usages",
             header: ["Authorization": "Bearer $TOKEN$"],
             data: nil
         )
@@ -1172,12 +1188,14 @@ public extension CLIProxyAPIClient {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw PoolClientError.invalidResponse("auth-url response was not JSON")
         }
-        guard let authURL = firstString(object["url"]), !authURL.isEmpty else {
+        guard let authURL = firstString(object["url"]),
+              let components = URLComponents(string: authURL), components.scheme == "https", components.host != nil,
+              let sessionState = firstString(object["state"]), !sessionState.isEmpty else {
             throw PoolClientError.invalidResponse(firstString(object["error"]) ?? "auth-url response missing url")
         }
         return OAuthAuthURL(
             url: authURL,
-            state: firstString(object["state"]) ?? "",
+            state: sessionState,
             flow: firstString(object["flow"]),
             userCode: firstString(firstValue(object["user_code"], object["userCode"])),
             expiresIn: intValue(firstValue(object["expires_in"], object["expiresIn"]))
@@ -1191,6 +1209,7 @@ public extension CLIProxyAPIClient {
 
     /// Relays a full redirect URL (manual paste fallback); the server extracts `code`/`state`.
     func submitOAuthCallback(provider: String, redirectURL: String, state: String) async throws {
+        try validateOAuthCallback(redirectURL, state: state)
         var body: [String: Any] = ["provider": provider, "redirect_url": redirectURL]
         if !state.isEmpty { body["state"] = state }
         try await postOAuthCallback(body: body)
@@ -1229,6 +1248,20 @@ public extension CLIProxyAPIClient {
         default:
             return .wait
         }
+    }
+
+    func cancelOAuthSession(state: String) async throws {
+        guard !state.isEmpty else { return }
+        var components = URLComponents(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/oauth-session"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "state", value: state)]
+        guard let url = components?.url else { throw PoolClientError.invalidResponse("invalid OAuth session URL") }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "DELETE"
+        applyManagementHeaders(to: &request)
+        _ = try await data(for: request)
     }
 
     /// Returns the configured API key list (`GET /v0/management/api-keys`).

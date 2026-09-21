@@ -328,6 +328,98 @@ final class ClientContractTests: XCTestCase {
         }
     }
 
+    func testDevinRefreshUsesOnlyAccountIdentity() async throws {
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/v0/management/auth-files/refresh")
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer management-secret")
+            let body = try XCTUnwrap(StubURLProtocol.jsonBody(request))
+            XCTAssertEqual(body["name"] as? String, "devin account.json")
+            XCTAssertEqual(body["auth_index"] as? String, "devin-index")
+            XCTAssertNil(body["all"])
+            return StubURLProtocol.jsonResponse(request, status: 200, object: [
+                "ok": true, "auth": ["metadata": ["session_token": "synthetic-secret"],
+                "quota": ["observed_at": "2026-09-21T12:00:00Z", "signals": [
+                    "daily_quota_remaining_percent": "91%", "weekly_quota_remaining_percent": "23%", "plan": "Pro"
+                ]]]
+            ])
+        }
+        let account = await makeClient().refreshUsage(for: AuthFile(
+            id: "virtual-id", authIndex: "devin-index", name: "devin account.json", provider: "devin"
+        ))
+        XCTAssertNil(account.errorMessage)
+        XCTAssertEqual(account.usage?.primary?.remainingPercent, 91)
+        XCTAssertEqual(account.usage?.weekly?.remainingPercent, 23)
+        XCTAssertFalse(String(describing: account).contains("synthetic-secret"))
+    }
+
+    func testDevinRefreshFailureKeepsDatedObservation() async throws {
+        StubURLProtocol.handler = { request in
+            StubURLProtocol.jsonResponse(request, status: 503, object: ["error": "unavailable"])
+        }
+        let detail = AccountDetail(dict: ["quota": ["observed_at": "2026-09-20T00:00:00Z", "signals": ["daily_quota_remaining_percent": "21%"]]])
+        let account = await makeClient().refreshUsage(for: AuthFile(
+            id: "devin", authIndex: "index", name: "devin.json", provider: "devin"
+        ), detail: detail)
+        XCTAssertNotNil(account.errorMessage)
+        XCTAssertEqual(account.usage?.primary?.remainingPercent, 21)
+        XCTAssertEqual(account.usage?.observation, .server(detail.devinQuota?.observedAt))
+    }
+
+    func testDevinOAuthCallbackPollingAndCancellation() async throws {
+        let recorder = StringRecorder()
+        StubURLProtocol.handler = { request in
+            let path = request.url!.path
+            recorder.append(path)
+            if path.hasSuffix("devin-auth-url") {
+                return StubURLProtocol.jsonResponse(request, status: 200, object: [
+                    "url": "https://app.devin.ai/auth/cli/continue?redirect_uri=http%3A%2F%2F127.0.0.1%3A18317%2Fcallback", "state": "devin-state"
+                ])
+            }
+            if path.hasSuffix("oauth-callback") {
+                let body = try XCTUnwrap(StubURLProtocol.jsonBody(request))
+                XCTAssertEqual(body["provider"] as? String, "devin")
+                XCTAssertEqual(body["state"] as? String, "devin-state")
+                XCTAssertTrue((body["redirect_url"] as? String ?? "").contains(":18317/callback"))
+            }
+            if path.hasSuffix("oauth-session") { XCTAssertEqual(request.httpMethod, "DELETE") }
+            return StubURLProtocol.jsonResponse(request, status: 200, object: ["status": "ok"])
+        }
+        let client = makeClient()
+        let auth = try await client.requestOAuthURL(for: .devin)
+        XCTAssertFalse(auth.isDeviceFlow)
+        try await client.submitOAuthCallback(provider: "devin", redirectURL: "http://127.0.0.1:18317/callback?code=example&state=devin-state", state: auth.state)
+        let status = try await client.pollOAuthStatus(state: auth.state)
+        XCTAssertEqual(status, .ok)
+        try await client.cancelOAuthSession(state: auth.state)
+        XCTAssertEqual(recorder.values().count, 4)
+    }
+
+    func testNewDeviceProvidersAndKimiAIDomain() async throws {
+        StubURLProtocol.handler = { request in
+            let path = request.url!.path
+            if path.hasSuffix("-auth-url") {
+                return StubURLProtocol.jsonResponse(request, status: 200, object: [
+                    "url": "https://example.com/device", "state": "session", "flow": "device", "user_code": "EXAMPLE"
+                ])
+            }
+            XCTAssertEqual(path, "/v0/management/api-call")
+            let body = try XCTUnwrap(StubURLProtocol.jsonBody(request))
+            XCTAssertEqual(body["url"] as? String, "https://api.kimi.ai/coding/v1/usages")
+            let header = try XCTUnwrap(body["header"] as? [String: String])
+            XCTAssertEqual(header["Authorization"], "Bearer $TOKEN$")
+            return StubURLProtocol.apiCallResponse(request, body: #"{"usage":{"limit":100,"used":20,"remaining":80}}"#)
+        }
+        let client = makeClient()
+        for provider in [OAuthProvider.meta, .kimiAI] {
+            let auth = try await client.requestOAuthURL(for: provider)
+            XCTAssertTrue(auth.isDeviceFlow)
+            XCTAssertEqual(auth.userCode, "EXAMPLE")
+        }
+        let quota = await client.refreshUsage(for: AuthFile(id: "kimi-ai", authIndex: "index", name: "kimi-ai.json", provider: "kimi-ai"))
+        XCTAssertNil(quota.errorMessage)
+    }
+
     private func makeClient() -> CLIProxyAPIClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]

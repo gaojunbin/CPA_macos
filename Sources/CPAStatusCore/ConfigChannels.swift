@@ -8,6 +8,8 @@ public enum APIKeyChannelKind: String, CaseIterable, Sendable {
     case gemini = "gemini-api-key"
     case interactions = "interactions-api-key"
     case vertex = "vertex-api-key"
+    case meta = "meta-api-key"
+    case xai = "xai-api-key"
 
     var modelType: String {
         self == .codex ? "openai" : definitionsChannel
@@ -15,6 +17,8 @@ public enum APIKeyChannelKind: String, CaseIterable, Sendable {
 
     var modelOwner: String {
         switch self {
+        case .meta: return "meta"
+        case .xai: return "xai"
         case .codex: return "openai"
         case .claude: return "anthropic"
         case .gemini, .interactions, .vertex: return "google"
@@ -32,6 +36,8 @@ public enum APIKeyChannelKind: String, CaseIterable, Sendable {
         case .claude: return "claude"
         case .gemini, .interactions: return "gemini"
         case .vertex: return "vertex"
+        case .meta: return "meta"
+        case .xai: return "xai"
         }
     }
 }
