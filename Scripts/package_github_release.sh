@@ -39,10 +39,10 @@ fi
 
 case "$APP_VARIANT" in
   jxa)
-    "$ROOT_DIR/Scripts/build_jxa_app.sh" >/dev/null
+    "$ROOT_DIR/Scripts/build_jxa_app.sh" >&2
     ;;
   native)
-    "$ROOT_DIR/Scripts/build_app.sh" >/dev/null
+    "$ROOT_DIR/Scripts/build_app.sh" >&2
     ;;
   *)
     echo "Unsupported APP_VARIANT: $APP_VARIANT" >&2
