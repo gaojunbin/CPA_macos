@@ -149,19 +149,19 @@ Existing versions through 1.3.1 do not contain the updater. Install the first up
 Create installable GitHub Release assets:
 
 ```bash
-VERSION=1.5.0 Scripts/package_github_release.sh
+VERSION=1.5.1 Scripts/package_github_release.sh
 ```
 
 The release files are written to `dist/github/`:
 
-- `CPA-1.5.0-macOS.dmg` for drag-to-Applications installation
-- `CPA-1.5.0-macOS.zip` as a fallback app bundle archive
-- `CPA-1.5.0-macOS-SHA256.txt` for checksum verification
+- `CPA-1.5.1-macOS.dmg` for drag-to-Applications installation
+- `CPA-1.5.1-macOS.zip` as a fallback app bundle archive
+- `CPA-1.5.1-macOS-SHA256.txt` for checksum verification
 
 By default the package script builds universal arm64/x86_64 native bundles, including the installer helper. `VERSION` sets both the embedded app version and release filenames; a mismatch fails packaging. Build intermediates use `/tmp/cpa-macos-build`. Set `BUILD_DIR`, `DIST_DIR`, or `OUTPUT_DIR` to redirect outputs; set `ARCHS=arm64` for a local architecture-only build. To package the JXA fallback bundle instead:
 
 ```bash
-APP_VARIANT=jxa VERSION=1.5.0 Scripts/package_github_release.sh
+APP_VARIANT=jxa VERSION=1.5.1 Scripts/package_github_release.sh
 ```
 
 Pushing a tag like `v1.0.0` runs the Release workflow and uploads the same assets to the GitHub Release.
