@@ -60,6 +60,8 @@ git diff --check
 - xAI documents the empty zero-valued `Cent` representation in its [billing implementation](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs). Management endpoints, bearer authentication, server-side `$TOKEN$` substitution, other providers, settings, and the update protocol are unchanged.
 - Release version: `1.5.2`, build `11`. Build and validation output is kept under `/tmp`; package verification and publication are separate from installed-app acceptance.
 - The local Swift toolchain stalled during startup after a system restart. The release workflow runs the complete regression suite before packaging. Local and CI Swift builds use two jobs by default (`BUILD_JOBS` can override the native packager limit).
+- [GitHub Actions run 40179641573](https://github.com/gaojunbin/CPA_macos/actions/runs/40179641573) passed all 76 XCTest cases, including five Grok zero/unknown/exhaustion regressions, and built the release from `8deafe332a05fcb41b401314a4d7a9510857bcb5`.
+- The published DMG and updater ZIP were downloaded and matched their SHA-256 checksums. `hdiutil verify`, strict recursive signature verification, both `arm64`/`x86_64` slices, and bundle version `1.5.2`/`11` were verified. Installed-app behavior and update/relaunch were not exercised.
 
 ## Next sync
 
