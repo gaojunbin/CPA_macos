@@ -26,10 +26,15 @@ jobs:
   package:
     name: Package macOS app
     runs-on: macos-latest
+    env:
+      TZ: Asia/Singapore
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Run regression tests
+        run: swift test --jobs 2 --scratch-path /tmp/cpa-macos-validation
 
       - name: Build release artifacts
         env:

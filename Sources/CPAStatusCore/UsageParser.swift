@@ -756,10 +756,11 @@ public enum UsageParser {
             config["billing_period_end"]
         )
         let resetAt = rawReset.flatMap { dateValue($0, now: now) }
-        let rawWeeklyUsed = percentNumberValue(firstValue(
-            config["creditUsagePercent"],
-            config["credit_usage_percent"]
-        ))
+        let rawWeeklyUsed = xaiUsagePercent(
+            in: config,
+            keys: ["creditUsagePercent", "credit_usage_percent"],
+            defaultsToZero: firstString(period["type"])?.lowercased().contains("weekly") == true
+        )
         let weeklyUsed = rawWeeklyUsed.map { clamp($0, min: 0, max: 100) }
         let weeklyRemaining = weeklyUsed.map { clamp(100 - $0, min: 0, max: 100) }
 
@@ -772,6 +773,7 @@ public enum UsageParser {
                 resetAfterSeconds: nil,
                 resetAt: resetAt,
                 displayValue: displayPercent(weeklyRemaining),
+                amountText: weeklyUsed.map { "已用 \(displayPercent($0))" },
                 detailText: displayShortDate(resetAt) ?? rawReset,
                 isUsable: weeklyRemaining.map { $0 > 0 }
             ))
@@ -783,7 +785,11 @@ public enum UsageParser {
                 continue
             }
             let product = firstString(item["product"]) ?? "Product \(index + 1)"
-            let rawUsed = percentNumberValue(firstValue(item["usagePercent"], item["usage_percent"]))
+            let rawUsed = xaiUsagePercent(
+                in: item,
+                keys: ["usagePercent", "usage_percent"],
+                defaultsToZero: firstString(item["product"]) != nil
+            )
             let used = rawUsed.map { clamp($0, min: 0, max: 100) }
             let remaining = used.map { clamp(100 - $0, min: 0, max: 100) }
             windows.append(QuotaWindow(
@@ -807,10 +813,10 @@ public enum UsageParser {
         now: Date,
         detailedPayAsYouGo: Bool
     ) -> [QuotaWindow] {
-        let monthlyLimit = centsValue(firstValue(config["monthlyLimit"], config["monthly_limit"]))
-        let used = centsValue(config["used"])
-        let onDemandCap = centsValue(firstValue(config["onDemandCap"], config["on_demand_cap"]))
-        let explicitOnDemandUsed = centsValue(firstValue(config["onDemandUsed"], config["on_demand_used"]))
+        let monthlyLimit = xaiCentsValue(firstValue(config["monthlyLimit"], config["monthly_limit"]))
+        let used = xaiCentsValue(config["used"])
+        let onDemandCap = xaiCentsValue(firstValue(config["onDemandCap"], config["on_demand_cap"]))
+        let explicitOnDemandUsed = xaiCentsValue(firstValue(config["onDemandUsed"], config["on_demand_used"]))
         let derivedOnDemandUsed: Double? = {
             guard let used, let monthlyLimit else {
                 return nil
@@ -870,6 +876,9 @@ public enum UsageParser {
         if let monthlyLimit, monthlyLimit > 0, let includedUsed {
             usedPercent = clamp((includedUsed / monthlyLimit) * 100, min: 0, max: 100)
             remainingPercent = clamp(100 - (usedPercent ?? 0), min: 0, max: 100)
+        } else if monthlyLimit == 0, includedUsed == 0 {
+            usedPercent = 0
+            remainingPercent = nil
         } else {
             usedPercent = nil
             remainingPercent = nil
@@ -882,13 +891,34 @@ public enum UsageParser {
             remainingPercent: remainingPercent,
             resetAfterSeconds: nil,
             resetAt: resetAt,
-            displayValue: displayPercent(remainingPercent),
+            displayValue: remainingPercent.map { displayPercent($0) }
+                ?? usedPercent.map { "已用 \(displayPercent($0))" },
             amountText: xaiAmount(usedCents: includedUsed, limitCents: monthlyLimit),
             detailText: displayShortDate(resetAt) ?? billingPeriodEnd,
             isUsable: remainingPercent.map { $0 > 0 }
         ))
 
         return windows
+    }
+
+    private static func xaiUsagePercent(
+        in object: [String: Any],
+        keys: [String],
+        defaultsToZero: Bool
+    ) -> Double? {
+        for key in keys where object[key] != nil {
+            return percentNumberValue(object[key])
+        }
+        // ProtoJSON omits zero-valued scalars inside a known usage record.
+        return defaultsToZero ? 0 : nil
+    }
+
+    private static func xaiCentsValue(_ value: Any?) -> Double? {
+        // A present, empty Cent message represents zero, not missing data.
+        if let dictionary = value as? [String: Any], dictionary.isEmpty {
+            return 0
+        }
+        return centsValue(value)
     }
 
     private static func centsValue(_ value: Any?) -> Double? {

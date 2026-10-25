@@ -5,10 +5,11 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="CPA"
 BUNDLE_ID="local.cpa.statusbar"
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
+BUILD_JOBS="${BUILD_JOBS:-2}"
 ICON_FILE="$ROOT_DIR/Resources/AppIcon.icns"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 BUILD_DIR="${BUILD_DIR:-/tmp/cpa-macos-build}"
-APP_VERSION="${VERSION:-1.5.1}"
+APP_VERSION="${VERSION:-1.5.2}"
 APP_VERSION="${APP_VERSION#v}"
 if [[ ! "$APP_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "Expected a stable semantic version, got: $APP_VERSION" >&2
@@ -19,8 +20,8 @@ BUILD_ARGS=()
 for arch in "${BUILD_ARCHS[@]}"; do BUILD_ARGS+=(--arch "$arch"); done
 
 cd "$ROOT_DIR"
-swift build -c "$BUILD_CONFIG" --scratch-path "$BUILD_DIR" "${BUILD_ARGS[@]}"
-BIN_DIR="$(swift build -c "$BUILD_CONFIG" --scratch-path "$BUILD_DIR" "${BUILD_ARGS[@]}" --show-bin-path)"
+swift build -c "$BUILD_CONFIG" --jobs "$BUILD_JOBS" --scratch-path "$BUILD_DIR" "${BUILD_ARGS[@]}"
+BIN_DIR="$(swift build -c "$BUILD_CONFIG" --jobs "$BUILD_JOBS" --scratch-path "$BUILD_DIR" "${BUILD_ARGS[@]}" --show-bin-path)"
 
 BINARY="$BIN_DIR/CPAStatusBar"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
@@ -60,7 +61,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key>
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>10</string>
+  <string>11</string>
   <key>CPAUpdateProtocol</key>
   <integer>1</integer>
   <key>LSMinimumSystemVersion</key>

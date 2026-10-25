@@ -51,6 +51,16 @@ git diff --check
 - Test output: `/tmp/cpa-providers-macos-final.log`. SwiftPM nested sandbox/cache overrides accommodate the restricted local build environment; they do not relax its outer filesystem restrictions.
 - Release packaging and public asset verification are tracked separately by GitHub Actions and the tagged Release. Developer ID signing, notarization, actual installed-app update/relaunch, and live-provider login/quota remain unverified.
 
+## Grok zero-usage correction (2026-10-25)
+
+- Client starting commit: `0acb4105bb7ad076c933eb8acbbd8beb181aa538`. The read-only upstream reference remains `v7.3.11`, `ffe6ad3c5fcf0a5eedd2198cd2e04b0249dc5063`.
+- Read-only authenticated billing requests on 2026-10-24 reproduced a weekly period with an omitted usage scalar and a monthly response with both limit and usage equal to zero. No account identifiers or credentials are retained in fixtures.
+- Decode omitted ProtoJSON usage scalars only within recognized weekly/product records and decode present empty xAI `Cent` messages as zero. Explicit null, invalid values, missing records, and request failures remain unknown or errors.
+- Preserve `usedPercent`, usage text, amounts, and reset metadata in Grok dashboard cards. A zero monthly limit and zero usage display `已用 0.0%`; remaining quota and usability stay unknown because a zero budget does not establish available credit. Weekly cards retain the remaining-percentage convention and also show `已用 0.0%`.
+- xAI documents the empty zero-valued `Cent` representation in its [billing implementation](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs). Management endpoints, bearer authentication, server-side `$TOKEN$` substitution, other providers, settings, and the update protocol are unchanged.
+- Release version: `1.5.2`, build `11`. Build and validation output is kept under `/tmp`; package verification and publication are separate from installed-app acceptance.
+- The local Swift toolchain stalled during startup after a system restart. The release workflow runs the complete regression suite before packaging. Local and CI Swift builds use two jobs by default (`BUILD_JOBS` can override the native packager limit).
+
 ## Next sync
 
 Compare `ffe6ad3c5fcf0a5eedd2198cd2e04b0249dc5063..HEAD` in the upstream reference. Include newly introduced built-in providers in the audit, preserve accurate quota semantics, and validate both native builds. Record live/cloud/distribution acceptance separately.

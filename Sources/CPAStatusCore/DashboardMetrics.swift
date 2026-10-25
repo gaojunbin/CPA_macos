@@ -136,21 +136,23 @@ public enum ProviderQuotaMetricKind: String, CaseIterable, Equatable, Hashable, 
     /// by their account-local average and the earliest reset time.
     public func averagedWindow(in account: AccountQuota) -> QuotaWindow? {
         let windows = matchingWindows(in: account)
-        guard let remainingPercent = remainingPercent(in: account) else { return nil }
+        let billingWindow = (self == .xaiWeekly || self == .xaiMonthly) ? windows.first : nil
+        let remainingPercent = remainingPercent(in: account)
+        guard remainingPercent != nil || billingWindow?.usedPercent != nil else { return nil }
         let resetAt = windows.compactMap(\.resetAt).min()
         let resetAfter = windows.compactMap(\.resetAfterSeconds).min()
         let details = uniqueStrings(windows.compactMap(\.detailText))
         return QuotaWindow(
             id: "dashboard-\(rawValue)",
             label: cardLabel,
-            usedPercent: max(0, min(100, 100 - remainingPercent)),
-            remainingPercent: max(0, min(100, remainingPercent)),
+            usedPercent: billingWindow?.usedPercent ?? remainingPercent.map { max(0, min(100, 100 - $0)) },
+            remainingPercent: remainingPercent.map { max(0, min(100, $0)) },
             resetAfterSeconds: resetAfter,
             resetAt: resetAt,
-            displayValue: displayPercent(remainingPercent),
-            amountText: nil,
+            displayValue: billingWindow?.displayValue ?? displayPercent(remainingPercent),
+            amountText: billingWindow?.amountText,
             detailText: details.count == 1 ? details[0] : nil,
-            isUsable: remainingPercent > 0
+            isUsable: remainingPercent.map { $0 > 0 }
         )
     }
 
