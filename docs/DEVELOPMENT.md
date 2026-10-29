@@ -2,7 +2,7 @@
 
 [Project overview](../README.md) · [Feature and integration reference](REFERENCE.md)
 
-Read [AGENTS.md](../AGENTS.md) for contributor rules and the code map, and [CPA_SYNC.md](../CPA_SYNC.md) for the audited upstream revision and compatibility evidence. All commands below run from the repository root.
+Read [AGENTS.md](../AGENTS.md) for contributor rules and the code map, and [CPA_SYNC.md](../CPA_SYNC.md) for the synced upstream revision. All commands below run from the repository root.
 
 ## Run from source
 

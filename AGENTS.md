@@ -15,14 +15,14 @@ Native macOS menu bar client (Swift Package Manager, Swift 5 language mode, macO
 
 ## Compatibility workflow
 
-1. Read [CPA_SYNC.md](CPA_SYNC.md) for the last audited upstream tag and full commit, client starting commit, scope, and validation limits.
+1. Read [CPA_SYNC.md](CPA_SYNC.md) for the last synced CLIProxyAPI and management web UI commits, then diff both upstream repositories from there.
 2. Inspect all working trees before changes. Compare the recorded upstream commit with the local upstream HEAD; do not assume the cloud deployment runs either version.
 3. Check existing endpoints against upstream `internal/api/server_management_v8.go`, `internal/api/server_management.go`, `docs/management-api-v8.md`, and `internal/api/handlers/management/`. Check config model resolution against `sdk/cliproxy/service_models.go` and field names against `internal/config/` and `internal/registry/`. Compare live quota request contracts with the current management web UI (`router-for-me/Cli-Proxy-API-Management-Center`).
 4. Operational endpoints use `/v8/management` (credentials, credential models/download/refresh, `requests/api-call`, OAuth, routing model definitions); servers before v8.0.0 are unsupported. Config reads (`*-api-key`, `openai-compatibility`, `oauth-model-alias`, `oauth-excluded-models`, `routing/strategy`, `force-model-prefix`) and client `api-keys` management stay on the deprecated-but-served `/v0/management` until the grouped v8 config tree is adopted. Preserve `Authorization: Bearer <management-key>`, `auth_index`, and server-side `$TOKEN$` substitution. The `api-call` request `data` and response `body` fields are JSON strings; the upstream HTTP status is nested in `status_code`.
 5. Keep config model aliases, duplicate upstream routing targets, wildcard exclusions, prefix policy, display names, and capability metadata aligned. Fully excluded explicit models must stay empty, without falling back to defaults. Base-URL-only credentials remain valid.
 6. Missing model runtime state is unknown. Current `quota`/`model_quotas` observations are not cooldown state. Neither model registration nor account `status: active` proves live quota availability. Low quota alone is not a connection-health failure.
 7. Fix the corresponding existing behavior in the sibling client when applicable; preserve platform-specific feature scope.
-8. Run relevant regression checks and the native build. Update this repository's `CPA_SYNC.md` with the exact upstream revision, changed and unchanged contracts, and actual evidence. Record cloud/device validation separately; do not invent an earlier sync baseline.
+8. Run relevant regression checks and the native build. After a sync, update only the date, commits, and versions in `CPA_SYNC.md` of both clients; keep change details and validation evidence in commit messages and release notes.
 
 ## Code map
 
