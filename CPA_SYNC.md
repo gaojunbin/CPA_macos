@@ -53,7 +53,9 @@ git diff --check
 ```
 
 - 84 XCTest cases passed (76 before this sync), including the current Antigravity summary filling the Gemini and Claude/GPT slots with weekly-blocked 5h buckets, Meta request contract and DCA-token rejection, the old-server 404 error, Claude/Codex/Antigravity/Grok request identities, Claude Fable/credit-pool/dollar/Team parsing, Kimi protobuf units and monthly totals, Kimi.ai aliases, Codex credits, and v8 OAuth paths. The release `CPAStatusBar` build and `git diff --check` passed. Logs: `/tmp/cpa-macos-test.log`, `/tmp/cpa-macos-release-build.log`.
-- Not verified: no authenticated request reached a deployment or provider in this sync (the Keychain authorization prompt for a read-only diagnostic was not approved), so the effect of the new identities on live Antigravity, Grok, Claude, Codex, and Meta responses, OAuth logins, installed-app behavior, signing, and release publication remain unverified.
+- [GitHub Actions run 40930117204](https://github.com/gaojunbin/CPA_macos/actions/runs/40930117204) passed all 84 XCTest cases and built the release from `4f8f2bd61999fa53f4fe9dba174e5f74b1462e8e`.
+- The published [v1.6.0](https://github.com/gaojunbin/CPA_macos/releases/tag/v1.6.0) DMG and updater ZIP were downloaded and matched their SHA-256 checksums. `hdiutil verify`, strict recursive ad-hoc signature verification, both `arm64`/`x86_64` slices, bundle version `1.6.0`/`12`, and update protocol `1` were verified.
+- Not verified: no authenticated request reached a deployment or provider in this sync (the Keychain authorization prompt for a read-only diagnostic was not approved), so the effect of the new identities on live Antigravity, Grok, Claude, Codex, and Meta responses, OAuth logins, installed-app behavior, update/relaunch, and Developer ID signing or notarization remain unverified.
 
 ## v7.3.11 provider sync (2026-09-21)
 
