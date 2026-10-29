@@ -22,8 +22,10 @@ final class GrokQuotaTests: XCTestCase {
         let usage = try XCTUnwrap(UsageParser.parse(#"{"_provider":"xai","weekly":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2099-01-08T00:00:00Z"},"productUsage":[{"product":"Grok Code"}]}},"monthly":{"config":{"monthlyLimit":{"val":10000},"used":{},"onDemandCap":{"val":5000},"onDemandUsed":{}}}}"#))
         for window in usage.additionalWindows {
             XCTAssertEqual(window.usedPercent, 0, window.id)
-            XCTAssertEqual(window.remainingPercent, 100, window.id)
+            // Product rows only break down the shared weekly usage.
+            XCTAssertEqual(window.remainingPercent, window.id == "xai-product-grok-code" ? nil : 100, window.id)
         }
+        XCTAssertEqual(usage.additionalWindows.first { $0.id == "xai-product-grok-code" }?.displayValue, "已用 0.0%")
         XCTAssertEqual(usage.additionalWindows.first?.amountText, "已用 0.0%")
         XCTAssertEqual(usage.additionalWindows.last?.amountText, "$0.00 / $100.00")
     }

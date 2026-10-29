@@ -38,6 +38,7 @@ public struct AccountCooldown: Decodable, Equatable, Sendable {
         case "model_not_supported": return "模型不受支持"
         case "not_found": return "上游资源不存在"
         case "transient_error": return "上游暂时异常"
+        case "transient_rate_limit": return "上游临时限流"
         default: return "暂时受限"
         }
     }

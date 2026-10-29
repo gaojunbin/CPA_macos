@@ -19,6 +19,7 @@ public enum PoolClientError: LocalizedError, Sendable {
     case invalidBaseURL(String)
     case httpStatus(Int, String)
     case invalidResponse(String)
+    case unsupportedServer
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +27,8 @@ public enum PoolClientError: LocalizedError, Sendable {
             return "Pool URL and management key are required."
         case let .invalidBaseURL(value):
             return "Invalid pool URL: \(value)"
+        case .unsupportedServer:
+            return "CLIProxyAPI v8.0.0 or later with the management API enabled is required (/v8/management returned 404)."
         case let .httpStatus(status, body):
             return "HTTP \(status): \(body.prefix(180))"
         case let .invalidResponse(message):
@@ -50,11 +53,17 @@ public struct CLIProxyAPIClient: Sendable {
     ]
     private static let antigravitySubscriptionURL =
         "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-    private static let antigravityUserAgent =
-        "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)"
-    private static let xaiClientVersion = "0.2.93"
+    // Matches the management web UI's Antigravity Hub identity; Cloud Code withholds
+    // newer models from clients below Hub 2.23.0.
+    private static let antigravityUserAgent = "antigravity/hub/2.23.0 darwin/arm64"
+    // cli-chat-proxy rejects Grok CLI versions below 1.0.13 with HTTP 426.
+    private static let xaiClientVersion = "1.0.46"
     private static let xaiBillingWeeklyURL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
     private static let xaiBillingMonthlyURL = "https://cli-chat-proxy.grok.com/v1/billing"
+    private static let claudeUserAgent = "claude-cli/2.1.280 (external, cli)"
+    private static let codexUserAgent =
+        "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
+    private static let metaQuotaURL = "https://api.meta.ai/muse-code/key"
 
     public init(settings: AppSettings, session: URLSession = .shared, timeout: TimeInterval = 45) {
         self.settings = settings
@@ -137,12 +146,18 @@ public struct CLIProxyAPIClient: Sendable {
             throw PoolClientError.notConfigured
         }
 
-        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files")
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/credentials")
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "GET"
         applyManagementHeaders(to: &request)
 
-        let data = try await data(for: request)
+        let data: Data
+        do {
+            data = try await self.data(for: request)
+        } catch PoolClientError.httpStatus(let status, _) where status == 404 {
+            // Servers before v8.0.0 do not expose the /v8/management routes.
+            throw PoolClientError.unsupportedServer
+        }
         let files = try JSONDecoder().decode(AuthFilesResponse.self, from: data).files
 
         var details: [String: AccountDetail] = [:]
@@ -163,7 +178,7 @@ public struct CLIProxyAPIClient: Sendable {
         // Multiple virtual accounts can share a filename; the server also accepts the unique auth ID.
         let queryName = auth.id.isEmpty ? auth.name : auth.id
         var components = URLComponents(
-            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/models"),
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/credentials/models"),
             resolvingAgainstBaseURL: false
         )
         components?.queryItems = [URLQueryItem(name: "name", value: queryName)]
@@ -417,10 +432,10 @@ public struct CLIProxyAPIClient: Sendable {
         }
     }
 
-    /// Static default models for a channel (`GET /v0/management/model-definitions/:channel`),
+    /// Static default models for a channel (`GET /v8/management/routing/model-definitions/:channel`),
     /// used for api-key entries that don't override `models`.
     public func fetchStaticModelDefinitions(channel: String) async throws -> [CPAModelDefinition] {
-        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/model-definitions/\(channel)")
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/routing/model-definitions/\(channel)")
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "GET"
         applyManagementHeaders(to: &request)
@@ -538,7 +553,7 @@ public struct CLIProxyAPIClient: Sendable {
 
     private static func authFileDownloadURL(baseURL: String, name: String) throws -> URL {
         var components = URLComponents(
-            url: try managementURL(baseURL: baseURL, path: "/v0/management/auth-files/download"),
+            url: try managementURL(baseURL: baseURL, path: "/v8/management/credentials/download"),
             resolvingAgainstBaseURL: false
         )
         var unreserved = CharacterSet.alphanumerics
@@ -658,6 +673,9 @@ public struct CLIProxyAPIClient: Sendable {
         if auth.isXAI {
             return try await fetchXAIUsage(auth: auth)
         }
+        if auth.isMeta {
+            return try await fetchMetaUsage(auth: auth)
+        }
         return try await fetchWhamUsage(auth: auth)
     }
 
@@ -666,7 +684,7 @@ public struct CLIProxyAPIClient: Sendable {
             "Authorization": "Bearer $TOKEN$",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "codex_cli_rs/0.76.0 (Macintosh; arm64) CPAStatusBar/1.0"
+            "User-Agent": Self.codexUserAgent
         ]
         if let accountID = auth.accountID, !accountID.isEmpty {
             headers["ChatGPT-Account-Id"] = accountID
@@ -839,11 +857,14 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     private func fetchClaudeUsage(auth: AuthFile) async throws -> UsageSnapshot {
-        let headers = [
+        var headers = [
             "Authorization": "Bearer $TOKEN$",
             "Content-Type": "application/json",
+            "User-Agent": Self.claudeUserAgent,
             "anthropic-beta": "oauth-2025-04-20"
         ]
+        let profileHeaders = headers
+        headers["Accept"] = "application/json"
         let usagePayload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
@@ -855,7 +876,7 @@ public struct CLIProxyAPIClient: Sendable {
             authIndex: auth.authIndex,
             method: "GET",
             url: "https://api.anthropic.com/api/oauth/profile",
-            header: headers,
+            header: profileHeaders,
             data: nil
         )
         async let usageTask = fetchAPICallEnvelope(payload: usagePayload)
@@ -885,7 +906,7 @@ public struct CLIProxyAPIClient: Sendable {
     }
 
     private func fetchDevinUsage(auth: AuthFile) async throws -> UsageSnapshot {
-        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/auth-files/refresh")
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/credentials/refresh")
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
         applyManagementHeaders(to: &request)
@@ -900,12 +921,49 @@ public struct CLIProxyAPIClient: Sendable {
         let payload = APICallRequest(
             authIndex: auth.authIndex,
             method: "GET",
-            url: auth.normalizedProvider == "kimi-ai"
+            url: auth.providerKey == "kimi-ai"
                 ? "https://api.kimi.ai/coding/v1/usages" : "https://api.kimi.com/coding/v1/usages",
             header: ["Authorization": "Bearer $TOKEN$"],
             data: nil
         )
         return try await fetchUsageViaAPICall(payload: payload)
+    }
+
+    /// Meta's quota endpoint takes the persisted DCA token, not the LLM key behind `$TOKEN$`.
+    /// The token and the response body stay request-local: errors never include the body,
+    /// which can echo the API key and profile data.
+    private func fetchMetaUsage(auth: AuthFile) async throws -> UsageSnapshot {
+        guard let body = try? await downloadAuthFile(named: auth.name),
+              let dcaToken = Self.metaDCAToken(fromAuthFileBody: body)
+        else {
+            throw PoolClientError.invalidResponse("missing Meta dca_token")
+        }
+        let payload = APICallRequest(
+            authIndex: auth.authIndex,
+            method: "POST",
+            url: Self.metaQuotaURL,
+            header: [
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer \(dcaToken)",
+                "x-api-version": "1.0.0"
+            ],
+            data: "{}"
+        )
+        let envelope = try await fetchAPICallEnvelope(payload: payload)
+        guard (200..<300).contains(envelope.statusCode) else {
+            throw PoolClientError.httpStatus(envelope.statusCode, "Meta quota request failed")
+        }
+        guard let response = Self.jsonObject(from: envelope.body) else {
+            throw PoolClientError.invalidResponse("invalid Meta quota response")
+        }
+        var quota: [String: Any] = [:]
+        quota["subs_usage"] = response["subs_usage"]
+        quota["subs_tier_name"] = response["subs_tier_name"]
+        guard let snapshot = UsageParser.parse(try jsonString(["_provider": "meta", "quota": quota])) else {
+            throw PoolClientError.invalidResponse("invalid Meta quota response")
+        }
+        return snapshot
     }
 
     private func fetchXAIUsage(auth: AuthFile) async throws -> UsageSnapshot {
@@ -978,7 +1036,7 @@ public struct CLIProxyAPIClient: Sendable {
 
     private func fetchAPICallEnvelope(payload: APICallRequest) async throws -> APICallEnvelope {
         var request = URLRequest(
-            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/api-call"),
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/requests/api-call"),
             timeoutInterval: timeout
         )
         request.httpMethod = "POST"
@@ -1055,6 +1113,16 @@ public struct CLIProxyAPIClient: Sendable {
             firstString(nested(root, "web", "project_id")),
             firstString(nested(root, "web", "projectId"))
         )
+    }
+
+    /// Only the persisted `dca:` token is accepted; the LLM API key is never a fallback.
+    static func metaDCAToken(fromAuthFileBody body: String) -> String? {
+        guard let token = firstString(jsonObject(from: body)?["dca_token"]),
+              token.range(of: #"^dca:\S+$"#, options: .regularExpression) != nil
+        else {
+            return nil
+        }
+        return token
     }
 
     private static func jsonObject(from body: String) -> [String: Any]? {
@@ -1180,7 +1248,14 @@ public extension CLIProxyAPIClient {
     /// while device providers are completed by server-side polling.
     func requestOAuthURL(for provider: OAuthProvider) async throws -> OAuthAuthURL {
         guard settings.isConfigured else { throw PoolClientError.notConfigured }
-        let url = try Self.managementURL(baseURL: settings.baseURL, path: provider.authPath)
+        var components = URLComponents(
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/oauth/auth-url"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "provider", value: provider.authProvider)]
+        guard let url = components?.url else {
+            throw PoolClientError.invalidResponse("invalid auth-url URL")
+        }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "GET"
         applyManagementHeaders(to: &request)
@@ -1216,7 +1291,7 @@ public extension CLIProxyAPIClient {
     }
 
     private func postOAuthCallback(body: [String: Any]) async throws {
-        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/oauth-callback")
+        let url = try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/oauth/callback")
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
         applyManagementHeaders(to: &request)
@@ -1225,10 +1300,10 @@ public extension CLIProxyAPIClient {
         _ = try await data(for: request)
     }
 
-    /// Polls `/v0/management/get-auth-status` for one tick.
+    /// Polls `/v8/management/oauth/status` for one tick.
     func pollOAuthStatus(state: String) async throws -> OAuthStatus {
         var components = URLComponents(
-            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/get-auth-status"),
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/oauth/status"),
             resolvingAgainstBaseURL: false
         )
         components?.queryItems = [URLQueryItem(name: "state", value: state)]
@@ -1253,7 +1328,7 @@ public extension CLIProxyAPIClient {
     func cancelOAuthSession(state: String) async throws {
         guard !state.isEmpty else { return }
         var components = URLComponents(
-            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v0/management/oauth-session"),
+            url: try Self.managementURL(baseURL: settings.baseURL, path: "/v8/management/oauth/session"),
             resolvingAgainstBaseURL: false
         )
         components?.queryItems = [URLQueryItem(name: "state", value: state)]

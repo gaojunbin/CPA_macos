@@ -30,6 +30,19 @@ final class UsageParserTests: XCTestCase {
         XCTAssertEqual(snapshot.primary?.resetAfterSeconds, 1200)
     }
 
+    func testParsesCodexCreditBalanceOnlyForPlainDecimalsOrUnlimited() throws {
+        func creditWindow(_ credits: String) throws -> QuotaWindow? {
+            let body = #"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}},"credits":"# + credits + "}"
+            return try XCTUnwrap(UsageParser.parse(body)).additionalWindows.first { $0.id == "codex-credit-balance" }
+        }
+        XCTAssertEqual(try creditWindow(#"{"has_credits":true,"balance":"12.50"}"#)?.displayValue, "12.50")
+        XCTAssertEqual(try creditWindow(#"{"balance":7}"#)?.displayValue, "7")
+        XCTAssertEqual(try creditWindow(#"{"unlimited":true,"balance":null}"#)?.displayValue, "无限额")
+        XCTAssertNil(try creditWindow(#"{"balance":"-1"}"#))
+        XCTAssertNil(try creditWindow(#"{"balance":"abc"}"#))
+        XCTAssertNil(try creditWindow(#"{"has_credits":false}"#))
+    }
+
     func testParsesQuotaLimitResponseWithResetSignal() throws {
         let body = """
         {
@@ -239,7 +252,80 @@ final class UsageParserTests: XCTestCase {
         XCTAssertEqual(snapshot.additionalWindows.map(\.label), ["5 小时限额", "7 天 Opus", "额外用量"])
         XCTAssertEqual(snapshot.additionalWindows.first?.remainingPercent, 75)
         XCTAssertEqual(snapshot.additionalWindows.first?.detailText, "05-28 01:31")
-        XCTAssertEqual(snapshot.additionalWindows.last?.amountText, "$1.23 / $10.00")
+        XCTAssertEqual(snapshot.additionalWindows.last?.displayValue, "已启用")
+        XCTAssertEqual(snapshot.additionalWindows.last?.amountText, "已花费 $1.23 / 限额 $10.00")
+    }
+
+    func testParsesClaudeFableCreditPoolsDollarBalancesAndTeamPlan() throws {
+        let body = """
+        {
+          "_provider": "claude",
+          "profile": {
+            "account": { "has_claude_max": true, "has_claude_pro": false },
+            "organization": { "organization_type": "claude_team", "subscription_status": "active" }
+          },
+          "usage": {
+            "seven_day": { "utilization": 10, "resets_at": "2026-05-27T17:31:04Z" },
+            "iguana_necktie": { "utilization": 99, "resets_at": "2026-05-27T17:31:04Z" },
+            "limits": [
+              { "kind": "weekly_scoped", "percent": 40, "is_active": false, "scope": { "model": { "display_name": "Fable" } } },
+              { "kind": "weekly_scoped", "percent": 30, "is_active": true, "resets_at": "2026-05-29T17:31:04Z", "scope": { "model": { "display_name": "Fable 5" } } }
+            ],
+            "workspace_spend": {
+              "limit_dollars": 50, "used_dollars": 12.5, "remaining_dollars": 37.5,
+              "utilization": 25, "resets_at": null
+            },
+            "extra_usage": {
+              "is_enabled": false, "used_credits": 0, "monthly_limit": 2000,
+              "utilization": 0, "currency": "EUR", "user_disabled": true
+            }
+          }
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertEqual(snapshot.planType, "团队版")
+        XCTAssertEqual(snapshot.additionalWindows.map(\.id), [
+            "claude-seven-day",
+            "claude-seven-day-fable",
+            "claude-balance-workspace-spend",
+            "claude-extra-usage"
+        ])
+        let fable = snapshot.additionalWindows[1]
+        XCTAssertEqual(fable.label, "7 天 Fable 5")
+        XCTAssertEqual(fable.remainingPercent, 70)
+        XCTAssertEqual(fable.detailText, "05-30 01:31")
+        let balance = snapshot.additionalWindows[2]
+        XCTAssertEqual(balance.label, "workspace_spend")
+        XCTAssertEqual(balance.displayValue, "剩余 $37.50")
+        XCTAssertEqual(balance.amountText, "已花费 $12.50 / 限额 $50.00")
+        XCTAssertEqual(balance.detailText, "重置时间未提供")
+        let extra = snapshot.additionalWindows[3]
+        XCTAssertEqual(extra.displayValue, "已禁用")
+        XCTAssertEqual(extra.amountText, "已花费 0.00 EUR / 限额 20.00 EUR")
+        XCTAssertEqual(extra.detailText, "已使用 0% · 用户已禁用")
+
+        let creditPool = try XCTUnwrap(UsageParser.parse("""
+        {
+          "_provider": "claude",
+          "usage": {
+            "iguana_necktie": {
+              "utilization": 40, "resets_at": "2026-05-27T17:31:04Z",
+              "limit_dollars": 20, "used_dollars": 8, "remaining_dollars": 12
+            }
+          }
+        }
+        """))
+        XCTAssertEqual(creditPool.additionalWindows.map(\.id), ["claude-cloud-session-credits"])
+        XCTAssertEqual(creditPool.additionalWindows.first?.label, "云端会话额度")
+        XCTAssertEqual(creditPool.additionalWindows.first?.remainingPercent, 60)
+        XCTAssertEqual(creditPool.additionalWindows.first?.amountText, "已花费 $8.00 / 限额 $20.00")
+
+        let legacyFable = try XCTUnwrap(UsageParser.parse("""
+        {"_provider":"claude","usage":{"iguana_necktie":{"utilization":25,"resets_at":"2026-05-27T17:31:04Z"}}}
+        """))
+        XCTAssertEqual(legacyFable.additionalWindows.map(\.label), ["7 天 Fable 5"])
+        XCTAssertEqual(legacyFable.additionalWindows.first?.remainingPercent, 75)
     }
 
     func testParsesKimiQuotaRowsLikeWebUI() throws {
@@ -267,11 +353,47 @@ final class UsageParserTests: XCTestCase {
         """
 
         let snapshot = try XCTUnwrap(UsageParser.parse(body))
-        XCTAssertEqual(snapshot.additionalWindows.map(\.label), ["周限额", "7天限额"])
-        XCTAssertEqual(snapshot.additionalWindows.first?.remainingPercent, 60)
-        XCTAssertEqual(snapshot.additionalWindows.first?.amountText, "40 / 100")
-        XCTAssertEqual(snapshot.additionalWindows.first?.detailText, "1h后重置")
-        XCTAssertEqual(snapshot.additionalWindows.last?.remainingPercent, 90)
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), ["7天限额", "周限额"])
+        XCTAssertEqual(snapshot.additionalWindows.first?.remainingPercent, 90)
+        XCTAssertEqual(snapshot.additionalWindows.last?.remainingPercent, 60)
+        XCTAssertEqual(snapshot.additionalWindows.last?.amountText, "40 / 100")
+        XCTAssertEqual(snapshot.additionalWindows.last?.detailText, "1h后重置")
+    }
+
+    func testParsesKimiProtobufTimeUnitsAndMonthlyTotal() throws {
+        let body = """
+        {
+          "limits": [
+            {
+              "detail": { "limit": "100", "used": "5", "remaining": "95", "resetTime": "2099-09-27T00:30:34.136523Z" },
+              "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" }
+            },
+            {
+              "detail": { "limit": "10", "used": "1" },
+              "window": { "duration": 90 }
+            },
+            {
+              "detail": { "limit": "10", "used": "1" },
+              "window": { "duration": 2, "timeUnit": "TIME_UNIT_WEEK" }
+            }
+          ],
+          "usages": { "limit_month_total": { "used_ratio": 0.2529, "reset_time": "2099-10-22T00:00:00Z" } }
+        }
+        """
+
+        let snapshot = try XCTUnwrap(UsageParser.parse(body))
+        XCTAssertEqual(snapshot.additionalWindows.map(\.label), ["5小时限额", "90分钟限额", "2周限额", "月限额"])
+        XCTAssertEqual(snapshot.additionalWindows.first?.remainingPercent, 95)
+        XCTAssertEqual(snapshot.additionalWindows.first?.detailText?.hasSuffix("后重置"), true)
+        let monthly = try XCTUnwrap(snapshot.additionalWindows.last)
+        XCTAssertEqual(monthly.id, "kimi-monthly")
+        XCTAssertEqual(monthly.usedPercent, 25)
+        XCTAssertEqual(monthly.remainingPercent, 75)
+        XCTAssertEqual(monthly.detailText?.hasSuffix("后重置"), true)
+
+        let monthlyOnly = try XCTUnwrap(UsageParser.parse(#"{"usages":{"limit_month_total":{"used_ratio":"0.5"}}}"#))
+        XCTAssertEqual(monthlyOnly.additionalWindows.map(\.label), ["月限额"])
+        XCTAssertNil(UsageParser.parse(#"{"usages":{}}"#)?.additionalWindows.first { $0.id == "kimi-monthly" })
     }
 
     func testParsesXAIQuotaRowsLikeWebUI() throws {
@@ -334,8 +456,14 @@ final class UsageParserTests: XCTestCase {
             "月度积分"
         ])
         XCTAssertEqual(snapshot.additionalWindows[0].remainingPercent, 65)
-        XCTAssertEqual(snapshot.additionalWindows[1].remainingPercent, 20)
-        XCTAssertEqual(snapshot.additionalWindows[2].remainingPercent, 87.5)
+        // Product rows break down the shared weekly credits instead of acting as separate allowances.
+        XCTAssertEqual(snapshot.additionalWindows[1].usedPercent, 80)
+        XCTAssertNil(snapshot.additionalWindows[1].remainingPercent)
+        XCTAssertNil(snapshot.additionalWindows[1].isUsable)
+        XCTAssertEqual(snapshot.additionalWindows[1].displayValue, "已用 80%")
+        XCTAssertEqual(snapshot.additionalWindows[1].detailText, "共享配额明细")
+        XCTAssertEqual(snapshot.additionalWindows[2].usedPercent, 12.5)
+        XCTAssertNil(snapshot.additionalWindows[2].remainingPercent)
         XCTAssertEqual(snapshot.additionalWindows[3].remainingPercent, 80)
         XCTAssertEqual(snapshot.additionalWindows[3].amountText, "已用 $10.00 / 封顶 $50.00")
         XCTAssertEqual(snapshot.additionalWindows[4].remainingPercent, 75)

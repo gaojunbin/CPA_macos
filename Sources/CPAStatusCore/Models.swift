@@ -71,8 +71,13 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
         normalizedProvider == "claude" || normalizedProvider == "anthropic"
     }
 
+    /// Catalog key with provider aliases resolved (for example `kimi.ai` → `kimi-ai`).
+    public var providerKey: String {
+        ProviderCatalog.info(for: normalizedProvider).key
+    }
+
     public var isKimi: Bool {
-        normalizedProvider == "kimi" || normalizedProvider == "kimi-ai"
+        providerKey == "kimi" || providerKey == "kimi-ai"
     }
 
     public var isDevin: Bool {
@@ -81,6 +86,10 @@ public struct AuthFile: Decodable, Identifiable, Equatable, Sendable {
 
     public var isXAI: Bool {
         normalizedProvider == "xai" || normalizedProvider == "x-ai" || normalizedProvider == "grok"
+    }
+
+    public var isMeta: Bool {
+        providerKey == "meta"
     }
 
     /// Memberwise init for entries synthesized locally (e.g. config-based channels)
@@ -392,7 +401,7 @@ public struct AccountCredits: Equatable, Sendable {
     public let paidTierID: String?
 }
 
-/// Rich per-account runtime data parsed from a single `/v0/management/auth-files` list entry.
+/// Rich per-account runtime data parsed from a single `/v8/management/credentials` list entry.
 /// Mirrors the fields the iOS detail screen surfaces, parsed leniently from raw JSON.
 public struct AccountDetail: Equatable, Sendable {
     public let devinQuota: DevinQuota?
@@ -818,7 +827,7 @@ public struct ModelThinkingCapabilities: Decodable, Equatable, Sendable {
 
 // MARK: - Service-wide model pool
 
-/// The per-account result of a `/v0/management/auth-files/models` query.
+/// The per-account result of a `/v8/management/credentials/models` query.
 /// `models == nil` means the query failed for that account (vs. an empty list).
 public struct AuthModelsResult: Sendable {
     public let auth: AuthFile
@@ -1062,7 +1071,7 @@ public enum ProviderCatalog {
         "xai": ProviderInfo(key: "xai", displayName: "Grok", symbolName: "x.circle.fill", accentName: "gray", priority: 7, supportsUsage: true),
         "kimi": ProviderInfo(key: "kimi", displayName: "Kimi", symbolName: "k.circle.fill", accentName: "pink", priority: 8, supportsUsage: true),
         "devin": ProviderInfo(key: "devin", displayName: "Devin", symbolName: "d.circle.fill", accentName: "blue", priority: 9, supportsUsage: true),
-        "meta": ProviderInfo(key: "meta", displayName: "Meta", symbolName: "infinity", accentName: "blue", priority: 10, supportsUsage: false),
+        "meta": ProviderInfo(key: "meta", displayName: "Meta", symbolName: "infinity", accentName: "blue", priority: 10, supportsUsage: true),
         "kimi-ai": ProviderInfo(key: "kimi-ai", displayName: "Kimi.ai", symbolName: "k.circle", accentName: "pink", priority: 11, supportsUsage: true),
         "xai-api-key": ProviderInfo(key: "xai-api-key", displayName: "Grok API Key", symbolName: "key.fill", accentName: "gray", priority: 46, supportsUsage: false),
         "meta-api-key": ProviderInfo(key: "meta-api-key", displayName: "Meta API Key", symbolName: "key.fill", accentName: "blue", priority: 45, supportsUsage: false),
@@ -1112,6 +1121,9 @@ public enum ProviderCatalog {
         if normalized == "x-ai" || normalized == "grok" {
             return "xai"
         }
+        // CLIProxyAPI also accepts domain-style Kimi credential types.
+        if normalized == "kimi.ai" { return "kimi-ai" }
+        if normalized == "kimi.com" { return "kimi" }
         return normalized
     }
 }

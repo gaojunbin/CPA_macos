@@ -24,6 +24,10 @@ public enum UsageParser {
             return snapshot
         }
 
+        if let snapshot = parseMetaPayload(root, now: now) {
+            return snapshot
+        }
+
         if let snapshot = parseClaudePayload(root, now: now) {
             return snapshot
         }
@@ -72,6 +76,9 @@ public enum UsageParser {
         var additional = parseCodeReviewWindows(codeReviewRateLimit, now: now)
         additional.append(contentsOf: parseAdditionalWindows(root, now: now))
         additional.append(contentsOf: buildCodexResetCreditsWindows(root, now: now))
+        if let creditBalance = buildCodexCreditBalanceWindow(root) {
+            additional.append(creditBalance)
+        }
         let status = firstString(root["status"], root["code"], nested(root, "error", "code"))
 
         let snapshot = UsageSnapshot(
@@ -83,6 +90,93 @@ public enum UsageParser {
             fetchedAt: now
         )
         return snapshot.hasQuotaSignal ? snapshot : nil
+    }
+
+    /// Meta Muse quota (`{"_provider":"meta","quota":{...}}`). Only plan and usage fields are read:
+    /// the upstream response also carries an API key and profile data that must not be retained.
+    /// A response without `subs_usage` is a successful observation with unknown quota, not zero.
+    private static func parseMetaPayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
+        guard firstString(root["_provider"])?.lowercased() == "meta" else {
+            return nil
+        }
+        let quota = firstDictionary(root["quota"]) ?? [:]
+        let usage = firstDictionary(quota["subs_usage"])
+        var windows: [QuotaWindow] = []
+        if let usage {
+            let rolling = firstDictionary(usage["window"]) ?? [:]
+            let minutes = numberValue(rolling["window_duration_mins"]).flatMap { $0 > 0 ? Int($0) : nil }
+            let durationText = minutes.map { $0 % 60 == 0 ? "\($0 / 60) 小时周期" : "\($0) 分钟周期" }
+            windows.append(buildMetaWindow(id: "meta-window", label: "周期额度", raw: rolling, durationText: durationText, now: now))
+            windows.append(buildMetaWindow(
+                id: "meta-weekly",
+                label: "每周额度",
+                raw: firstDictionary(usage["weekly"]) ?? [:],
+                durationText: nil,
+                now: now
+            ))
+        }
+        return UsageSnapshot(
+            planType: firstString(quota["subs_tier_name"], usage?["tier"]),
+            primary: nil,
+            weekly: nil,
+            additionalWindows: windows,
+            rawStatus: usage == nil ? "usage_unknown" : "usage_available",
+            fetchedAt: now
+        )
+    }
+
+    private static func buildMetaWindow(
+        id: String,
+        label: String,
+        raw: [String: Any],
+        durationText: String?,
+        now: Date
+    ) -> QuotaWindow {
+        let used = numberValue(raw["used_percent"]).map { clamp($0, min: 0, max: 100) }
+        let remaining = used.map { 100 - $0 }
+        let resetAt = numberValue(raw["resets_at"]).flatMap { $0 > 0 ? dateValue($0, now: now) : nil }
+        let detailParts = uniqueNonEmptyStrings([durationText, displayShortDate(resetAt)])
+        return QuotaWindow(
+            id: id,
+            label: label,
+            usedPercent: used,
+            remainingPercent: remaining,
+            resetAfterSeconds: nil,
+            resetAt: resetAt,
+            displayValue: displayPercent(remaining),
+            detailText: detailParts.isEmpty ? nil : detailParts.joined(separator: " · "),
+            isUsable: remaining.map { $0 > 0 }
+        )
+    }
+
+    /// Codex credits: a balance is shown only when it is a plain non-negative decimal.
+    private static func buildCodexCreditBalanceWindow(_ root: [String: Any]) -> QuotaWindow? {
+        guard let credits = firstDictionary(root["credits"]) else {
+            return nil
+        }
+        let unlimited = boolValue(credits["unlimited"]) == true
+        let balance: String?
+        if let text = credits["balance"] as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            balance = trimmed.range(of: #"^\d+(\.\d+)?$"#, options: .regularExpression) == nil ? nil : trimmed
+        } else if let value = numberValue(credits["balance"]), value >= 0 {
+            balance = displayCount(value)
+        } else {
+            balance = nil
+        }
+        guard unlimited || balance != nil else {
+            return nil
+        }
+        return QuotaWindow(
+            id: "codex-credit-balance",
+            label: "Credit 余额",
+            usedPercent: nil,
+            remainingPercent: nil,
+            resetAfterSeconds: nil,
+            resetAt: nil,
+            displayValue: unlimited ? "无限额" : balance,
+            isUsable: nil
+        )
     }
 
     private static let antigravityModelGroups: [AntigravityModelGroup] = [
@@ -155,6 +249,14 @@ public enum UsageParser {
                     let rhsLabel = firstString(rhs.1["displayName"], rhs.1["display_name"], rhs.1["bucketId"], rhs.1["bucket_id"]) ?? ""
                     return lhsLabel.localizedCaseInsensitiveCompare(rhsLabel) == .orderedAscending
                 }
+            // Upstream keeps a full 5h bucket at 1.0 while the group's weekly limit is exhausted,
+            // but that 5h allowance cannot be used until the weekly window resets.
+            let weeklyExhausted = orderedBuckets.contains { _, bucket in
+                antigravityBucketOrder(bucket) == 1 && (fractionOrPercentFractionValue(firstValue(
+                    bucket["remainingFraction"],
+                    bucket["remaining_fraction"]
+                )) ?? 1) <= 0
+            }
 
             for (bucketIndex, bucket) in orderedBuckets {
                 guard let remainingFraction = fractionOrPercentFractionValue(firstValue(
@@ -178,9 +280,11 @@ public enum UsageParser {
                 let remainingPercent = normalizedFraction * 100
                 let groupID = stableIdentifier(groupLabel, fallback: "quota-group-\(groupIndex + 1)")
                 let bucketID = stableIdentifier(rawBucketID, fallback: "bucket-\(bucketIndex + 1)")
+                let blockedByWeekly = weeklyExhausted && antigravityBucketOrder(bucket) == 0
                 let detailParts = uniqueNonEmptyStrings([
                     window,
-                    displayShortDate(resetAt) ?? rawResetTime
+                    displayShortDate(resetAt) ?? rawResetTime,
+                    blockedByWeekly ? "周限额已用尽" : nil
                 ])
 
                 windows.append(QuotaWindow(
@@ -192,7 +296,7 @@ public enum UsageParser {
                     resetAt: resetAt,
                     displayValue: displayPercent(remainingPercent),
                     detailText: detailParts.isEmpty ? nil : detailParts.joined(separator: " · "),
-                    isUsable: remainingPercent > 0
+                    isUsable: remainingPercent > 0 && !blockedByWeekly
                 ))
             }
         }
@@ -446,12 +550,15 @@ public enum UsageParser {
         ("seven_day_opus", "seven-day-opus", "7 天 Opus"),
         ("seven_day_sonnet", "seven-day-sonnet", "7 天 Sonnet"),
         ("seven_day_cowork", "seven-day-cowork", "7 天 Cowork"),
-        ("iguana_necktie", "iguana-necktie", "Iguana Necktie")
+        ("iguana_necktie", "seven-day-fable", "7 天 Fable 5")
     ]
+
+    private static let claudeDollarFields = ["limit_dollars", "used_dollars", "remaining_dollars", "utilization", "resets_at"]
 
     private static func parseClaudePayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
         let provider = firstString(root["_provider"])?.lowercased()
         let usage = provider == "claude" ? firstDictionary(root["usage"]) ?? [:] : root
+        let fableLimit = claudeFableLimit(usage)
 
         var windows: [QuotaWindow] = []
         for definition in claudeWindows {
@@ -460,19 +567,31 @@ public enum UsageParser {
             else {
                 continue
             }
-
-            let used = numberValue(raw["utilization"]).map { clamp($0, min: 0, max: 100) }
-            let resetAt = dateValue(firstValue(raw["resets_at"], raw["resetsAt"]), now: now)
-            windows.append(QuotaWindow(
+            if definition.key == "iguana_necktie" {
+                // The same key also carries the dollar-denominated cloud session pool.
+                if isClaudeDollarWindow(raw) {
+                    windows.append(buildClaudeCloudSessionWindow(raw, now: now))
+                    continue
+                }
+                if fableLimit != nil {
+                    continue
+                }
+            }
+            windows.append(buildClaudeWindow(
                 id: "claude-\(definition.id)",
                 label: definition.label,
-                usedPercent: used,
-                remainingPercent: used.map { clamp(100 - $0, min: 0, max: 100) },
-                resetAfterSeconds: nil,
-                resetAt: resetAt,
-                displayValue: used.map { displayPercent(clamp(100 - $0, min: 0, max: 100)) },
-                detailText: displayShortDate(resetAt),
-                isUsable: used.map { $0 < 100 }
+                used: numberValue(raw["utilization"]),
+                rawReset: firstValue(raw["resets_at"], raw["resetsAt"]),
+                now: now
+            ))
+        }
+        if let fableLimit {
+            windows.append(buildClaudeWindow(
+                id: "claude-seven-day-fable",
+                label: "7 天 Fable 5",
+                used: numberValue(fableLimit["percent"]),
+                rawReset: firstValue(fableLimit["resets_at"], fableLimit["resetsAt"]),
+                now: now
             ))
         }
 
@@ -480,22 +599,9 @@ public enum UsageParser {
             return nil
         }
 
-        if let extraUsage = firstDictionary(usage["extra_usage"], usage["extraUsage"]),
-           boolValue(firstValue(extraUsage["is_enabled"], extraUsage["isEnabled"])) == true {
-            let used = centsValue(firstValue(extraUsage["used_credits"], extraUsage["usedCredits"]))
-            let limit = centsValue(firstValue(extraUsage["monthly_limit"], extraUsage["monthlyLimit"]))
-            windows.append(QuotaWindow(
-                id: "claude-extra-usage",
-                label: "额外用量",
-                usedPercent: nil,
-                remainingPercent: nil,
-                resetAfterSeconds: nil,
-                resetAt: nil,
-                displayValue: "--",
-                amountText: extraUsageAmount(usedCents: used, limitCents: limit),
-                detailText: nil,
-                isUsable: nil
-            ))
+        windows.append(contentsOf: buildClaudeDollarWindows(usage, now: now))
+        if let extraUsage = firstDictionary(usage["extra_usage"], usage["extraUsage"]) {
+            windows.append(buildClaudeExtraUsageWindow(extraUsage))
         }
 
         let profile = firstDictionary(root["profile"])
@@ -509,52 +615,157 @@ public enum UsageParser {
         )
     }
 
+    private static func buildClaudeWindow(id: String, label: String, used rawUsed: Double?, rawReset: Any?, now: Date) -> QuotaWindow {
+        let used = rawUsed.map { clamp($0, min: 0, max: 100) }
+        let resetAt = dateValue(rawReset, now: now)
+        return QuotaWindow(
+            id: id,
+            label: label,
+            usedPercent: used,
+            remainingPercent: used.map { clamp(100 - $0, min: 0, max: 100) },
+            resetAfterSeconds: nil,
+            resetAt: resetAt,
+            displayValue: used.map { displayPercent(clamp(100 - $0, min: 0, max: 100)) },
+            detailText: displayShortDate(resetAt),
+            isUsable: used.map { $0 < 100 }
+        )
+    }
+
+    /// Claude reports the Fable weekly window in `limits[]`; it supersedes `iguana_necktie`.
+    private static func claudeFableLimit(_ usage: [String: Any]) -> [String: Any]? {
+        let candidates = (firstArray(usage["limits"]) ?? []).compactMap { $0 as? [String: Any] }.filter { limit in
+            let scope = firstDictionary(limit["scope"]) ?? [:]
+            let model = firstString(nested(scope, "model", "display_name"))?.lowercased()
+            return firstString(limit["kind"])?.lowercased() == "weekly_scoped"
+                && (model == "fable" || model == "fable 5")
+                && numberValue(limit["percent"]) != nil
+        }
+        return candidates.first { boolValue($0["is_active"]) == true } ?? candidates.first
+    }
+
+    private static func isClaudeDollarWindow(_ raw: [String: Any]) -> Bool {
+        ["limit_dollars", "used_dollars", "remaining_dollars"].contains { numberValue(raw[$0]) != nil }
+    }
+
+    private static func buildClaudeCloudSessionWindow(_ raw: [String: Any], now: Date) -> QuotaWindow {
+        let window = buildClaudeWindow(
+            id: "claude-cloud-session-credits",
+            label: "云端会话额度",
+            used: numberValue(raw["utilization"]),
+            rawReset: raw["resets_at"],
+            now: now
+        )
+        return QuotaWindow(
+            id: window.id,
+            label: window.label,
+            usedPercent: window.usedPercent,
+            remainingPercent: window.remainingPercent,
+            resetAfterSeconds: nil,
+            resetAt: window.resetAt,
+            displayValue: window.displayValue,
+            amountText: claudeDollarAmount(raw),
+            detailText: window.detailText,
+            isUsable: window.isUsable
+        )
+    }
+
+    /// Independent dollar balances are any other usage objects carrying the full dollar field set.
+    private static func buildClaudeDollarWindows(_ usage: [String: Any], now: Date) -> [QuotaWindow] {
+        let skippedKeys: Set<String> = ["five_hour", "seven_day", "extra_usage", "iguana_necktie"]
+        return usage.keys.sorted().compactMap { key -> QuotaWindow? in
+            guard !skippedKeys.contains(key),
+                  let raw = usage[key] as? [String: Any],
+                  claudeDollarFields.allSatisfy({ raw.keys.contains($0) })
+            else {
+                return nil
+            }
+            let used = numberValue(raw["utilization"]).map { clamp($0, min: 0, max: 100) }
+            let remainingDollars = numberValue(raw["remaining_dollars"])
+            let resetAt = dateValue(raw["resets_at"], now: now)
+            return QuotaWindow(
+                id: "claude-balance-\(stableIdentifier(key, fallback: "balance"))",
+                label: key,
+                usedPercent: used,
+                remainingPercent: used.map { clamp(100 - $0, min: 0, max: 100) },
+                resetAfterSeconds: nil,
+                resetAt: resetAt,
+                displayValue: "剩余 \(displayDollars(remainingDollars))",
+                amountText: claudeDollarAmount(raw),
+                detailText: displayShortDate(resetAt) ?? "重置时间未提供",
+                isUsable: remainingDollars.map { $0 > 0 }
+            )
+        }
+    }
+
+    private static func claudeDollarAmount(_ raw: [String: Any]) -> String? {
+        let used = numberValue(raw["used_dollars"])
+        let limit = numberValue(raw["limit_dollars"])
+        guard used != nil || limit != nil else {
+            return nil
+        }
+        return "已花费 \(displayDollars(used)) / 限额 \(displayDollars(limit))"
+    }
+
+    /// Extra usage is shown whether or not it is enabled; its amounts are minor currency units.
+    private static func buildClaudeExtraUsageWindow(_ extraUsage: [String: Any]) -> QuotaWindow {
+        let enabled = boolValue(firstValue(extraUsage["is_enabled"], extraUsage["isEnabled"]))
+        let currency = firstString(extraUsage["currency"])
+        let used = centsValue(firstValue(extraUsage["used_credits"], extraUsage["usedCredits"]))
+        let limit = centsValue(firstValue(extraUsage["monthly_limit"], extraUsage["monthlyLimit"]))
+        let notes = uniqueNonEmptyStrings([
+            numberValue(extraUsage["utilization"]).map { "已使用 \(displayCount($0))%" },
+            boolValue(extraUsage["user_disabled"]) == true ? "用户已禁用" : nil,
+            boolValue(extraUsage["spend_limit_reached"]) == true ? "已达到消费限额" : nil,
+            firstString(extraUsage["disabled_reason"]).map { "原因：\($0)" }
+        ])
+        return QuotaWindow(
+            id: "claude-extra-usage",
+            label: "额外用量",
+            usedPercent: nil,
+            remainingPercent: nil,
+            resetAfterSeconds: nil,
+            resetAt: nil,
+            displayValue: enabled.map { $0 ? "已启用" : "已禁用" } ?? "未知",
+            amountText: "已花费 \(displayCurrency(cents: used, code: currency)) / 限额 \(displayCurrency(cents: limit, code: currency))",
+            detailText: notes.isEmpty ? nil : notes.joined(separator: " · "),
+            isUsable: nil
+        )
+    }
+
     private static func claudePlanType(_ profile: [String: Any]?) -> String? {
         guard let profile else {
             return nil
         }
-        let account = firstDictionary(profile["account"]) ?? [:]
-        if boolValue(account["has_claude_max"]) == true {
-            return "Max"
-        }
-        if boolValue(account["has_claude_pro"]) == true {
-            return "专业版"
-        }
+        // Account flags include personal subscriptions even for a Team-scoped token.
         let organization = firstDictionary(profile["organization"]) ?? [:]
         let organizationType = firstString(organization["organization_type"])?.lowercased()
         let subscriptionStatus = firstString(organization["subscription_status"])?.lowercased()
         if organizationType == "claude_team", subscriptionStatus == "active" {
             return "团队版"
         }
-        if boolValue(account["has_claude_max"]) == false,
-           boolValue(account["has_claude_pro"]) == false {
+        let account = firstDictionary(profile["account"]) ?? [:]
+        let hasMax = boolValue(account["has_claude_max"])
+        if hasMax == true {
+            return "Max"
+        }
+        let hasPro = boolValue(account["has_claude_pro"])
+        if hasPro == true {
+            return "专业版"
+        }
+        if hasMax == false, hasPro == false {
             return "免费版"
         }
         return nil
     }
 
-    private static func extraUsageAmount(usedCents: Double?, limitCents: Double?) -> String? {
-        guard usedCents != nil || limitCents != nil else {
-            return nil
-        }
-        let used = displayCurrency(cents: usedCents)
-        guard limitCents != nil else {
-            return used
-        }
-        return "\(used) / \(displayCurrency(cents: limitCents))"
-    }
-
     private static func parseKimiPayload(_ root: [String: Any], now: Date) -> UsageSnapshot? {
-        guard root["usage"] != nil || root["limits"] != nil else {
+        let monthlyTotal = firstDictionary(nested(root, "usages", "limit_month_total"))
+        guard root["usage"] != nil || root["limits"] != nil || monthlyTotal != nil else {
             return nil
         }
 
+        // Rolling limits come first, then the weekly summary, then the monthly total.
         var windows: [QuotaWindow] = []
-        if let usage = firstDictionary(root["usage"]),
-           let window = buildKimiWindow(id: "kimi-summary", raw: usage, fallbackLabel: "周限额", now: now) {
-            windows.append(window)
-        }
-
         if let limits = firstArray(root["limits"]) {
             for (index, item) in limits.enumerated() {
                 guard let item = item as? [String: Any] else {
@@ -565,6 +776,20 @@ public enum UsageParser {
                 if let window = buildKimiWindow(id: "kimi-limit-\(index)", raw: raw, fallbackLabel: label, now: now) {
                     windows.append(window)
                 }
+            }
+        }
+
+        if let usage = firstDictionary(root["usage"]),
+           let window = buildKimiWindow(id: "kimi-summary", raw: usage, fallbackLabel: "周限额", now: now) {
+            windows.append(window)
+        }
+
+        // Plans without a weekly limit report only a monthly used ratio.
+        if let monthlyTotal, let ratio = numberValue(monthlyTotal["used_ratio"]) {
+            var raw: [String: Any] = ["used": Int((ratio * 100).rounded()), "limit": 100]
+            raw["reset_time"] = monthlyTotal["reset_time"]
+            if let window = buildKimiWindow(id: "kimi-monthly", raw: raw, fallbackLabel: "月限额", now: now) {
+                windows.append(window)
             }
         }
 
@@ -631,16 +856,23 @@ public enum UsageParser {
         return "限额 #\(index + 1)"
     }
 
+    /// Kimi sends protobuf enum names such as `TIME_UNIT_MINUTE`; a missing unit means minutes.
     private static func displayKimiDuration(_ duration: Int, unit: String?) -> String {
-        switch unit?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
-        case "MINUTES":
-            return duration % 60 == 0 ? "\(duration / 60)小时" : "\(duration)分钟"
-        case "HOURS":
-            return "\(duration)小时"
-        case "DAYS":
-            return "\(duration)天"
-        default:
+        var normalized = unit?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+        if normalized.hasPrefix("TIME_UNIT_") {
+            normalized.removeFirst("TIME_UNIT_".count)
+        }
+        switch normalized {
+        case "SECOND", "SECONDS":
             return "\(duration)秒"
+        case "HOUR", "HOURS":
+            return "\(duration)小时"
+        case "DAY", "DAYS":
+            return "\(duration)天"
+        case "WEEK", "WEEKS":
+            return "\(duration)周"
+        default:
+            return duration % 60 == 0 ? "\(duration / 60)小时" : "\(duration)分钟"
         }
     }
 
@@ -779,6 +1011,7 @@ public enum UsageParser {
             ))
         }
 
+        // Product rows break down usage of the shared weekly credits; they are not separate allowances.
         let productUsage = firstArray(config["productUsage"], config["product_usage"]) ?? []
         for (index, rawItem) in productUsage.enumerated() {
             guard let item = rawItem as? [String: Any] else {
@@ -791,17 +1024,16 @@ public enum UsageParser {
                 defaultsToZero: firstString(item["product"]) != nil
             )
             let used = rawUsed.map { clamp($0, min: 0, max: 100) }
-            let remaining = used.map { clamp(100 - $0, min: 0, max: 100) }
             windows.append(QuotaWindow(
                 id: "xai-product-\(stableIdentifier(product, fallback: "\(index + 1)"))",
                 label: "\(product) 使用",
                 usedPercent: used,
-                remainingPercent: remaining,
+                remainingPercent: nil,
                 resetAfterSeconds: nil,
-                resetAt: resetAt,
-                displayValue: displayPercent(remaining),
-                detailText: displayShortDate(resetAt) ?? rawReset,
-                isUsable: remaining.map { $0 > 0 }
+                resetAt: nil,
+                displayValue: used.map { "已用 \(displayPercent($0))" } ?? "用量暂不可用",
+                detailText: "共享配额明细",
+                isUsable: nil
             ))
         }
 
@@ -1345,11 +1577,19 @@ public enum UsageParser {
     }
 }
 
-private func displayCurrency(cents: Double?) -> String {
+private func displayCurrency(cents: Double?, code: String? = nil) -> String {
     guard let cents, cents.isFinite else {
         return "--"
     }
-    return String(format: "$%.2f", cents / 100)
+    let currency = code?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+    guard !currency.isEmpty, currency != "USD" else {
+        return String(format: "$%.2f", cents / 100)
+    }
+    return String(format: "%.2f ", cents / 100) + currency
+}
+
+private func displayDollars(_ value: Double?) -> String {
+    displayCurrency(cents: value.map { $0 * 100 })
 }
 
 private struct AntigravityModelGroup {

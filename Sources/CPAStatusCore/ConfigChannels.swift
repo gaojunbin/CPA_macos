@@ -1,7 +1,7 @@
 import Foundation
 
 /// The config.yaml api-key sections that serve models but never appear in
-/// `/v0/management/auth-files` (the server lists file/OAuth credentials only).
+/// `/v8/management/credentials` (the server lists file/OAuth credentials only).
 public enum APIKeyChannelKind: String, CaseIterable, Sendable {
     case codex = "codex-api-key"
     case claude = "claude-api-key"
@@ -27,7 +27,7 @@ public enum APIKeyChannelKind: String, CaseIterable, Sendable {
 
     public var managementPath: String { "/v0/management/\(rawValue)" }
 
-    /// Channel key for `/v0/management/model-definitions/:channel`, used when an
+    /// Channel key for `/v8/management/routing/model-definitions/:channel`, used when an
     /// entry has no per-key `models` override (the server then serves the channel's
     /// static default models).
     public var definitionsChannel: String {

@@ -142,6 +142,10 @@ public enum ProviderQuotaMetricKind: String, CaseIterable, Equatable, Hashable, 
         let resetAt = windows.compactMap(\.resetAt).min()
         let resetAfter = windows.compactMap(\.resetAfterSeconds).min()
         let details = uniqueStrings(windows.compactMap(\.detailText))
+        // A slot whose every bucket is blocked (for example an Antigravity 5h bucket behind an
+        // exhausted weekly limit) stays unusable even when its remaining percentage is positive.
+        let usableFlags = windows.compactMap(\.isUsable)
+        let allBlocked = !usableFlags.isEmpty && !usableFlags.contains(true)
         return QuotaWindow(
             id: "dashboard-\(rawValue)",
             label: cardLabel,
@@ -152,7 +156,7 @@ public enum ProviderQuotaMetricKind: String, CaseIterable, Equatable, Hashable, 
             displayValue: billingWindow?.displayValue ?? displayPercent(remainingPercent),
             amountText: billingWindow?.amountText,
             detailText: details.count == 1 ? details[0] : nil,
-            isUsable: remainingPercent.map { $0 > 0 }
+            isUsable: allBlocked ? false : remainingPercent.map { $0 > 0 }
         )
     }
 

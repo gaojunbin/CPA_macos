@@ -9,7 +9,8 @@ final class ClientContractTests: XCTestCase {
 
     func testXAIAuthURLUsesDeviceFlowMetadata() async throws {
         StubURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.path, "/v0/management/xai-auth-url")
+            XCTAssertEqual(request.url?.path, "/v8/management/oauth/auth-url")
+            XCTAssertEqual(request.url?.query, "provider=xai")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer management-secret")
             return StubURLProtocol.jsonResponse(
                 request,
@@ -36,7 +37,7 @@ final class ClientContractTests: XCTestCase {
         let recorder = RequestRecorder()
         StubURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
-            if path == "/v0/management/auth-files" {
+            if path == "/v8/management/credentials" {
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "files": [[
                         "id": "xai-account",
@@ -46,10 +47,10 @@ final class ClientContractTests: XCTestCase {
                     ]]
                 ])
             }
-            if path == "/v0/management/auth-files/download" {
+            if path == "/v8/management/credentials/download" {
                 return StubURLProtocol.dataResponse(request, status: 200, data: Data(#"{"sub":"xai-user-123"}"#.utf8))
             }
-            if path == "/v0/management/api-call" {
+            if path == "/v8/management/requests/api-call" {
                 let payload = try XCTUnwrap(StubURLProtocol.jsonBody(request))
                 recorder.append(payload)
                 let target = payload["url"] as? String ?? ""
@@ -74,7 +75,7 @@ final class ClientContractTests: XCTestCase {
         for call in calls {
             let headers = try XCTUnwrap(call["header"] as? [String: String])
             XCTAssertEqual(headers["x-xai-token-auth"], "xai-grok-cli")
-            XCTAssertEqual(headers["x-grok-client-version"], "0.2.93")
+            XCTAssertEqual(headers["x-grok-client-version"], "1.0.46")
             XCTAssertEqual(headers["x-userid"], "xai-user-123")
         }
     }
@@ -83,7 +84,7 @@ final class ClientContractTests: XCTestCase {
         let recorder = RequestRecorder()
         StubURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
-            if path == "/v0/management/auth-files" {
+            if path == "/v8/management/credentials" {
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "files": [[
                         "id": "antigravity-account",
@@ -94,7 +95,7 @@ final class ClientContractTests: XCTestCase {
                     ]]
                 ])
             }
-            if path == "/v0/management/api-call" {
+            if path == "/v8/management/requests/api-call" {
                 let payload = try XCTUnwrap(StubURLProtocol.jsonBody(request))
                 recorder.append(payload)
                 let target = payload["url"] as? String ?? ""
@@ -119,13 +120,80 @@ final class ClientContractTests: XCTestCase {
         XCTAssertFalse(targets.contains { $0.contains("fetchAvailableModels") })
         let quotaCall = try XCTUnwrap(calls.first { (($0["url"] as? String) ?? "").contains("retrieveUserQuotaSummary") })
         XCTAssertEqual(quotaCall["data"] as? String, #"{"project":"project-123"}"#)
+        for call in calls {
+            let headers = try XCTUnwrap(call["header"] as? [String: String])
+            XCTAssertEqual(headers["User-Agent"], "antigravity/hub/2.23.0 darwin/arm64")
+        }
+    }
+
+    func testMetaQuotaUsesPersistedDCATokenAndDropsResponseSecrets() async throws {
+        let recorder = RequestRecorder()
+        StubURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/v8/management/credentials" {
+                return StubURLProtocol.jsonResponse(request, status: 200, object: [
+                    "files": [[
+                        "id": "meta-account",
+                        "auth_index": "meta-index",
+                        "name": "meta-account.json",
+                        "provider": "meta"
+                    ]]
+                ])
+            }
+            if path == "/v8/management/credentials/download" {
+                return StubURLProtocol.dataResponse(request, status: 200, data: Data(#"{"type":"meta","api_key":"LLM|synthetic","dca_token":"dca:synthetic-token"}"#.utf8))
+            }
+            if path == "/v8/management/requests/api-call" {
+                let payload = try XCTUnwrap(StubURLProtocol.jsonBody(request))
+                recorder.append(payload)
+                return StubURLProtocol.apiCallResponse(request, body: #"{"api_key":"LLM|synthetic-response","user_email":"fixture@example.invalid","subs_tier_name":"Muse Code Everyday Usage","subs_usage":{"window":{"used_percent":2,"window_duration_mins":300,"resets_at":4102444800},"weekly":{"used_percent":0,"resets_at":4103049600},"tier":"fixture-tier"}}"#)
+            }
+            return StubURLProtocol.jsonResponse(request, status: 404, object: ["error": "not found"])
+        }
+
+        let snapshot = try await makeClient().fetchPoolSnapshot()
+        let account = try XCTUnwrap(snapshot.providers.first { $0.provider.key == "meta" }?.accounts.first)
+        let usage = try XCTUnwrap(account.usage)
+        XCTAssertEqual(usage.planType, "Muse Code Everyday Usage")
+        XCTAssertEqual(usage.additionalWindows.map(\.id), ["meta-window", "meta-weekly"])
+        XCTAssertEqual(usage.additionalWindows.map(\.remainingPercent), [98, 100])
+        XCTAssertEqual(usage.additionalWindows.first?.detailText?.hasPrefix("5 小时周期"), true)
+
+        let call = try XCTUnwrap(recorder.values().first)
+        XCTAssertEqual(recorder.values().count, 1)
+        XCTAssertEqual(call["url"] as? String, "https://api.meta.ai/muse-code/key")
+        XCTAssertEqual(call["method"] as? String, "POST")
+        XCTAssertEqual(call["data"] as? String, "{}")
+        let headers = try XCTUnwrap(call["header"] as? [String: String])
+        XCTAssertEqual(headers["Authorization"], "Bearer dca:synthetic-token")
+        XCTAssertEqual(headers["x-api-version"], "1.0.0")
+    }
+
+    func testMetaQuotaRejectsCredentialsWithoutDCAToken() {
+        XCTAssertNil(CLIProxyAPIClient.metaDCAToken(fromAuthFileBody: #"{"api_key":"LLM|synthetic"}"#))
+        XCTAssertNil(CLIProxyAPIClient.metaDCAToken(fromAuthFileBody: #"{"dca_token":"LLM|synthetic"}"#))
+        XCTAssertNil(CLIProxyAPIClient.metaDCAToken(fromAuthFileBody: #"{"dca_token":"dca:"}"#))
+        XCTAssertEqual(CLIProxyAPIClient.metaDCAToken(fromAuthFileBody: #"{"dca_token":" dca:abc "}"#), "dca:abc")
+    }
+
+    func testOldServersWithoutV8RoutesReportUnsupportedVersion() async throws {
+        StubURLProtocol.handler = { request in
+            StubURLProtocol.jsonResponse(request, status: 404, object: ["error": "not found"])
+        }
+        do {
+            _ = try await makeClient().fetchPoolSnapshot()
+            XCTFail("expected an unsupported server error")
+        } catch PoolClientError.unsupportedServer {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 
     func testCodexUsageAlsoRequestsResetCreditsWithoutConsumingThem() async throws {
         let recorder = RequestRecorder()
         StubURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
-            if path == "/v0/management/auth-files" {
+            if path == "/v8/management/credentials" {
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "files": [[
                         "id": "codex-account",
@@ -136,7 +204,7 @@ final class ClientContractTests: XCTestCase {
                     ]]
                 ])
             }
-            if path == "/v0/management/api-call" {
+            if path == "/v8/management/requests/api-call" {
                 let payload = try XCTUnwrap(StubURLProtocol.jsonBody(request))
                 recorder.append(payload)
                 let target = payload["url"] as? String ?? ""
@@ -161,6 +229,31 @@ final class ClientContractTests: XCTestCase {
         XCTAssertEqual(headers["OpenAI-Beta"], "codex-1")
         XCTAssertEqual(headers["Originator"], "Codex Desktop")
         XCTAssertEqual(headers["ChatGPT-Account-Id"], "chatgpt-account")
+        XCTAssertEqual(headers["User-Agent"], "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)")
+    }
+
+    func testClaudeQuotaSendsCLIUserAgent() async throws {
+        let recorder = RequestRecorder()
+        StubURLProtocol.handler = { request in
+            let payload = try XCTUnwrap(StubURLProtocol.jsonBody(request))
+            recorder.append(payload)
+            if (payload["url"] as? String ?? "").hasSuffix("/usage") {
+                return StubURLProtocol.apiCallResponse(request, body: #"{"five_hour":{"utilization":20,"resets_at":"2099-01-01T00:00:00Z"}}"#)
+            }
+            return StubURLProtocol.apiCallResponse(request, body: #"{"account":{"has_claude_pro":true}}"#)
+        }
+        let quota = await makeClient().refreshUsage(for: AuthFile(id: "claude", authIndex: "index", name: "claude.json", provider: "claude"))
+        XCTAssertEqual(quota.usage?.additionalWindows.first?.remainingPercent, 80)
+        XCTAssertEqual(quota.usage?.planType, "专业版")
+        let calls = recorder.values()
+        XCTAssertEqual(calls.count, 2)
+        for call in calls {
+            let headers = try XCTUnwrap(call["header"] as? [String: String])
+            XCTAssertEqual(headers["User-Agent"], "claude-cli/2.1.280 (external, cli)")
+            XCTAssertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        }
+        let usageCall = try XCTUnwrap(calls.first { ($0["url"] as? String ?? "").hasSuffix("/usage") })
+        XCTAssertEqual((usageCall["header"] as? [String: String])?["Accept"], "application/json")
     }
 
     func testRoutingSnapshotDownloadsEncodedSafePerAccountOverridesWithFallbacks() async throws {
@@ -170,7 +263,7 @@ final class ClientContractTests: XCTestCase {
         StubURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
             switch path {
-            case "/v0/management/auth-files":
+            case "/v8/management/credentials":
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "files": [
                         [
@@ -202,7 +295,7 @@ final class ClientContractTests: XCTestCase {
                     ]
                 ])
 
-            case "/v0/management/auth-files/download":
+            case "/v8/management/credentials/download":
                 let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
                 let name = try XCTUnwrap(components.queryItems?.first { $0.name == "name" }?.value)
                 downloadedNames.append(name)
@@ -232,7 +325,7 @@ final class ClientContractTests: XCTestCase {
                 }
                 return StubURLProtocol.jsonResponse(request, status: 503, object: ["error": "temporarily unavailable"])
 
-            case "/v0/management/auth-files/models":
+            case "/v8/management/credentials/models":
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "models": [["id": "gpt-5"]]
                 ])
@@ -330,7 +423,7 @@ final class ClientContractTests: XCTestCase {
 
     func testDevinRefreshUsesOnlyAccountIdentity() async throws {
         StubURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.path, "/v0/management/auth-files/refresh")
+            XCTAssertEqual(request.url?.path, "/v8/management/credentials/refresh")
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer management-secret")
             let body = try XCTUnwrap(StubURLProtocol.jsonBody(request))
@@ -371,18 +464,20 @@ final class ClientContractTests: XCTestCase {
         StubURLProtocol.handler = { request in
             let path = request.url!.path
             recorder.append(path)
-            if path.hasSuffix("devin-auth-url") {
+            if path == "/v8/management/oauth/auth-url" {
+                XCTAssertEqual(request.url?.query, "provider=devin")
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "url": "https://app.devin.ai/auth/cli/continue?redirect_uri=http%3A%2F%2F127.0.0.1%3A18317%2Fcallback", "state": "devin-state"
                 ])
             }
-            if path.hasSuffix("oauth-callback") {
+            if path == "/v8/management/oauth/callback" {
                 let body = try XCTUnwrap(StubURLProtocol.jsonBody(request))
                 XCTAssertEqual(body["provider"] as? String, "devin")
                 XCTAssertEqual(body["state"] as? String, "devin-state")
                 XCTAssertTrue((body["redirect_url"] as? String ?? "").contains(":18317/callback"))
             }
-            if path.hasSuffix("oauth-session") { XCTAssertEqual(request.httpMethod, "DELETE") }
+            if path == "/v8/management/oauth/status" { XCTAssertEqual(request.url?.query, "state=devin-state") }
+            if path == "/v8/management/oauth/session" { XCTAssertEqual(request.httpMethod, "DELETE") }
             return StubURLProtocol.jsonResponse(request, status: 200, object: ["status": "ok"])
         }
         let client = makeClient()
@@ -392,18 +487,23 @@ final class ClientContractTests: XCTestCase {
         let status = try await client.pollOAuthStatus(state: auth.state)
         XCTAssertEqual(status, .ok)
         try await client.cancelOAuthSession(state: auth.state)
-        XCTAssertEqual(recorder.values().count, 4)
+        XCTAssertEqual(recorder.values(), [
+            "/v8/management/oauth/auth-url",
+            "/v8/management/oauth/callback",
+            "/v8/management/oauth/status",
+            "/v8/management/oauth/session"
+        ])
     }
 
     func testNewDeviceProvidersAndKimiAIDomain() async throws {
         StubURLProtocol.handler = { request in
             let path = request.url!.path
-            if path.hasSuffix("-auth-url") {
+            if path == "/v8/management/oauth/auth-url" {
                 return StubURLProtocol.jsonResponse(request, status: 200, object: [
                     "url": "https://example.com/device", "state": "session", "flow": "device", "user_code": "EXAMPLE"
                 ])
             }
-            XCTAssertEqual(path, "/v0/management/api-call")
+            XCTAssertEqual(path, "/v8/management/requests/api-call")
             let body = try XCTUnwrap(StubURLProtocol.jsonBody(request))
             XCTAssertEqual(body["url"] as? String, "https://api.kimi.ai/coding/v1/usages")
             let header = try XCTUnwrap(body["header"] as? [String: String])
@@ -416,8 +516,11 @@ final class ClientContractTests: XCTestCase {
             XCTAssertTrue(auth.isDeviceFlow)
             XCTAssertEqual(auth.userCode, "EXAMPLE")
         }
-        let quota = await client.refreshUsage(for: AuthFile(id: "kimi-ai", authIndex: "index", name: "kimi-ai.json", provider: "kimi-ai"))
-        XCTAssertNil(quota.errorMessage)
+        for provider in ["kimi-ai", "kimi.ai", "kimi_ai"] {
+            let quota = await client.refreshUsage(for: AuthFile(id: provider, authIndex: "index", name: "\(provider).json", provider: provider))
+            XCTAssertNil(quota.errorMessage)
+            XCTAssertEqual(quota.usage?.additionalWindows.first?.remainingPercent, 80)
+        }
     }
 
     private func makeClient() -> CLIProxyAPIClient {

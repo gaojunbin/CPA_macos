@@ -20,7 +20,7 @@ Available features depend on your CPA server version and provider. Live quota is
 
 ## Get started
 
-Requires **macOS 13 or later**, on Apple Silicon or Intel.
+Requires **macOS 13 or later**, on Apple Silicon or Intel, and **CLIProxyAPI v8.0.0 or later** on the server.
 
 1. Download the DMG from [GitHub Releases](https://github.com/gaojunbin/CPA_macos/releases/latest) and drag CPA into Applications.
 2. Open CPA from the menu bar and add your server's HTTPS address and management password.

@@ -34,21 +34,21 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
         }
     }
 
-    /// Management endpoint that mints the authorization URL + session state.
-    public var authPath: String {
+    /// `provider` value for the shared `/v8/management/oauth/auth-url` login endpoint.
+    public var authProvider: String {
         switch self {
-        case .codex: return "/v0/management/codex-auth-url"
-        case .claude: return "/v0/management/anthropic-auth-url"
-        case .antigravity: return "/v0/management/antigravity-auth-url"
-        case .xai: return "/v0/management/xai-auth-url"
-        case .kimi: return "/v0/management/kimi-auth-url"
-        case .devin: return "/v0/management/devin-auth-url"
-        case .meta: return "/v0/management/meta-auth-url"
-        case .kimiAI: return "/v0/management/kimi-ai-auth-url"
+        case .codex: return "codex"
+        case .claude: return "claude"
+        case .antigravity: return "antigravity"
+        case .xai: return "xai"
+        case .kimi: return "kimi"
+        case .devin: return "devin"
+        case .meta: return "meta"
+        case .kimiAI: return "kimi-ai"
         }
     }
 
-    /// Canonical provider identifier expected by `/v0/management/oauth-callback`.
+    /// Canonical provider identifier expected by `/v8/management/oauth/callback`.
     public var callbackProvider: String {
         switch self {
         case .codex: return "codex"
@@ -92,14 +92,14 @@ public enum OAuthProvider: String, CaseIterable, Sendable {
     }
 }
 
-/// Result of polling `/v0/management/get-auth-status`.
+/// Result of polling `/v8/management/oauth/status`.
 public enum OAuthStatus: Equatable, Sendable {
     case ok
     case wait
     case error(String)
 }
 
-/// The authorization URL and opaque session state returned by an `*-auth-url` endpoint.
+/// The authorization URL and opaque session state returned by `/v8/management/oauth/auth-url`.
 public struct OAuthAuthURL: Sendable {
     public let url: String
     public let state: String

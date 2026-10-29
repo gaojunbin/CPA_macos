@@ -4,7 +4,9 @@
 
 ## Connection setup
 
-CLIProxyAPI must already be running on your server. Enable remote management with `remote-management.allow-remote: true` and configure `remote-management.secret-key` or `MANAGEMENT_PASSWORD`. Use HTTPS for an internet-facing server.
+CLIProxyAPI v8.0.0 or later must already be running on your server. Enable remote management with `management.allow-remote: true` (legacy layout: `remote-management.allow-remote`) and configure `management.secret-key` or `MANAGEMENT_PASSWORD`. Use HTTPS for an internet-facing server.
+
+Credentials, live quota calls, OAuth, and model definitions use `/v8/management`. Configuration reads (config channels, OAuth aliases and exclusions, routing strategy, prefix policy) and client API key management still use the legacy `/v0/management` endpoints, which v8 servers continue to serve. A server without the v8 routes reports `CLIProxyAPI v8.0.0 or later … is required`.
 
 On first launch, click the menu bar icon and add your first service:
 
@@ -19,12 +21,18 @@ The management password is stored in macOS Keychain. You can add more services a
 
 It reads the management API with the configured password, then refreshes each Codex account through:
 
-- `GET /v0/management/auth-files`
-- `POST /v0/management/api-call`
+- `GET /v8/management/credentials`
+- `POST /v8/management/requests/api-call`
 - Upstream target `https://chatgpt.com/backend-api/wham/usage`
 
-Antigravity accounts use the management web UI's current `retrieveUserQuotaSummary` groups/buckets contract plus `loadCodeAssist` subscription metadata, with the legacy model-map endpoint retained as a fallback.
-Claude and Kimi use the same upstream quota endpoints and response shapes as the management web UI. Grok merges weekly credit/product usage with monthly and on-demand billing data using the current CLI request headers.
+Quota requests follow the management web UI's current contracts and client identities:
+
+- Antigravity uses `retrieveUserQuotaSummary` groups/buckets plus `loadCodeAssist` subscription metadata with the Antigravity Hub user agent, keeping the legacy model-map endpoint as a fallback. Gemini and Claude/GPT groups each report 5h and weekly windows; a full 5h bucket is unusable while its group's weekly limit is exhausted.
+- Claude reads usage and profile with the Claude CLI user agent, including the Fable 5 weekly window, the cloud session credit pool, independent dollar balances, and extra usage whether or not it is enabled. Team organizations take precedence over personal plan flags.
+- Codex WHAM usage also shows the credit balance (or unlimited credits) and reset credits.
+- Kimi lists rolling limits, the weekly summary, and the monthly total. Kimi.ai credentials (`kimi-ai`, `kimi.ai`, `kimi_ai`) use the kimi.ai coding API host.
+- Grok merges weekly credits with monthly and on-demand billing using the current Grok CLI version; per-product rows are a breakdown of the shared weekly credits, not separate allowances.
+- Meta reads the Muse quota endpoint with the credential's persisted `dca:` token (never the LLM key) and keeps only plan, rolling-window, and weekly usage. Missing usage stays unknown.
 
 The menu bar and top card show only the healthy account/channel ratio (`7/7`, `6/7`, …), while each OAuth provider keeps its own compact ratio. Provider quota summaries are equal-weight account-pool averages: Codex and Claude use 5h/7d, Antigravity separates Gemini and Claude/GPT 5h/7d, and Grok uses weekly/monthly credits. Dashboard account cards keep only those provider-specific headline rows; full quota windows remain available in account detail.
 
@@ -61,13 +69,13 @@ When an account drops its login, re-authorize it without opening the web UI. The
 3. **复制授权链接**, open it in whichever browser you like, and log in.
 4. For Codex / Claude / Antigravity / Devin: after login the browser is redirected to a `http://localhost:<port>/…` address (the page will look like it failed to load — that's expected). **Copy that whole address from the address bar, paste it into the app, and click 提交.** Grok/xAI, Kimi, Kimi.ai, and Meta use device flows — authorize in the browser and the app detects completion automatically.
 
-How it works: the app requests the auth URL (`/v0/management/<provider>-auth-url`) and polls `/v0/management/get-auth-status` until done. Redirect-based providers also send your pasted URL to `/v0/management/oauth-callback`; device-flow providers need no callback. The server performs the token exchange, so the app never handles account tokens. The popover stays open while you switch to the browser and back.
+How it works: the app requests the auth URL (`/v8/management/oauth/auth-url?provider=<provider>`) and polls `/v8/management/oauth/status` until done. Redirect-based providers also send your pasted URL to `/v8/management/oauth/callback`; device-flow providers need no callback. The server performs the token exchange, so the app never handles account tokens. The popover stays open while you switch to the browser and back.
 
 > The loopback callback URL works even when CLIProxyAPI runs on a remote VPS — you're only relaying the URL the provider handed your browser, and the server completes the exchange.
 
 Devin uses `http://127.0.0.1:<server-port>/callback`, so retain the actual callback URL instead of assuming a fixed port. Callbacks must match the current login state; closing or restarting authorization cancels the pending server session.
 
-Devin quota refresh targets one credential through `/v0/management/auth-files/refresh`. The client retains only the returned quota observation: plan, daily/weekly remaining percentages, reset times, and the server observation timestamp. Missing, invalid, and expired windows stay unknown. Zero quota does not invent a scheduler cooldown. Meta accounts expose identity and models without claiming an unsupported live-quota endpoint. Kimi.ai uses its own coding API host.
+Devin quota refresh targets one credential through `/v8/management/credentials/refresh`. The client retains only the returned quota observation: plan, daily/weekly remaining percentages, reset times, and the server observation timestamp. Missing, invalid, and expired windows stay unknown. Zero quota does not invent a scheduler cooldown. Kimi.ai uses its own coding API host.
 
 ### API key management (API 密钥)
 
@@ -91,7 +99,7 @@ Click **•••** → **模型列表…** to inspect models advertised by the 
 - A `2/3`-style pill flags models only some of a provider's accounts can serve; a note appears if any account's model query failed.
 - Where the server returns capability metadata, rows compactly show context/output limits, thinking, multimodal input/output, and Web Search support.
 
-How it works: the app lists auth files (`/v0/management/auth-files`), skips disabled or unavailable ones, queries `/v0/management/auth-files/models?name=…` for each in parallel batches, and merges the results per provider. Config channels never appear in the auth-files list, so they are read from `/v0/management/openai-compatibility` (model aliases straight from config) and the supported `…-api-key` sections (per-key `models` overrides, falling back to `/v0/management/model-definitions/<channel>` static defaults minus `excluded-models`).
+How it works: the app lists credentials (`/v8/management/credentials`), skips disabled or unavailable ones, queries `/v8/management/credentials/models?name=…` for each in parallel batches, and merges the results per provider. Config channels never appear in the credential list, so they are read from `/v0/management/openai-compatibility` (model aliases straight from config) and the supported `…-api-key` sections (per-key `models` overrides, falling back to `/v8/management/routing/model-definitions/<channel>` static defaults minus `excluded-models`).
 
 ### Upstream model routing (上游模型路由)
 
@@ -104,7 +112,7 @@ The branch button in the dashboard opens a menu-bar-native routing view. It show
 - config-channel prefixes, priorities, base URLs, exclusions, credential counts, and advertised model counts;
 - `interactions-api-key` alongside Codex, Claude, Gemini, Vertex, and OpenAI-compatible channels.
 
-The routing view reads `/v0/management/oauth-model-alias`, `/oauth-excluded-models`, `/force-model-prefix`, `/routing/strategy`, auth-file models, and config-channel endpoints. For file-backed OAuth accounts it temporarily downloads the auth JSON only while opening this screen, extracts the routing fields, and immediately discards the raw credential payload. Tokens and identity claims are never retained or displayed; proxy userinfo, query strings, and fragments are removed before entering the UI snapshot.
+The routing view reads `/v0/management/oauth-model-alias`, `/oauth-excluded-models`, `/force-model-prefix`, `/routing/strategy`, credential models, and config-channel endpoints. For file-backed OAuth accounts it temporarily downloads the auth JSON only while opening this screen, extracts the routing fields, and immediately discards the raw credential payload. Tokens and identity claims are never retained or displayed; proxy userinfo, query strings, and fragments are removed before entering the UI snapshot.
 
 ## Automatic application updates
 

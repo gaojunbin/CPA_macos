@@ -140,6 +140,53 @@ final class DashboardMetricsTests: XCTestCase {
         )
     }
 
+    func testCurrentAntigravitySummaryFillsGeminiAndClaudeGPTSlots() throws {
+        let body = """
+        {
+          "_provider": "antigravity",
+          "quota": {
+            "groups": [
+              {
+                "displayName": "Gemini Models",
+                "description": "Models within this group: Gemini Flash, Gemini Pro",
+                "buckets": [
+                  { "bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "resetTime": "2099-10-23T02:43:12Z", "remainingFraction": 0.4 },
+                  { "bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "resetTime": "2099-10-20T02:43:12Z", "remainingFraction": 0.9 }
+                ]
+              },
+              {
+                "displayName": "Claude and GPT models",
+                "buckets": [
+                  { "bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "resetTime": "2099-10-23T02:43:12Z", "remainingFraction": 0 },
+                  { "bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "resetTime": "2099-10-20T02:43:12Z", "remainingFraction": 1 }
+                ]
+              }
+            ]
+          },
+          "subscription": {}
+        }
+        """
+        let usage = try XCTUnwrap(UsageParser.parse(body))
+        let auth = AuthFile(id: "ag", authIndex: "idx-ag", name: "ag.json", provider: "antigravity")
+        let account = AccountQuota(auth: auth, usage: usage, errorMessage: nil)
+
+        let geminiFiveHour = try XCTUnwrap(ProviderQuotaMetricKind.antigravityGeminiFiveHour.averagedWindow(in: account))
+        XCTAssertEqual(try XCTUnwrap(geminiFiveHour.remainingPercent), 90, accuracy: 0.001)
+        XCTAssertEqual(geminiFiveHour.isUsable, true)
+        let geminiWeekly = try XCTUnwrap(ProviderQuotaMetricKind.antigravityGeminiSevenDay.averagedWindow(in: account))
+        XCTAssertEqual(try XCTUnwrap(geminiWeekly.remainingPercent), 40, accuracy: 0.001)
+        XCTAssertEqual(ProviderQuotaMetricKind.antigravityClaudeGPTSevenDay.averagedWindow(in: account)?.remainingPercent, 0)
+
+        // A full 5h bucket cannot be used while its group's weekly limit is exhausted.
+        let blocked = try XCTUnwrap(ProviderQuotaMetricKind.antigravityClaudeGPTFiveHour.matchingWindows(in: account).first)
+        XCTAssertEqual(blocked.remainingPercent, 100)
+        XCTAssertEqual(blocked.isUsable, false)
+        XCTAssertEqual(blocked.detailText?.hasSuffix("周限额已用尽"), true)
+        XCTAssertEqual(ProviderQuotaMetricKind.antigravityClaudeGPTFiveHour.averagedWindow(in: account)?.isUsable, false)
+        let geminiBucket = try XCTUnwrap(ProviderQuotaMetricKind.antigravityGeminiFiveHour.matchingWindows(in: account).first)
+        XCTAssertEqual(geminiBucket.id, "antigravity-gemini-models-gemini-5h")
+    }
+
     private func account(
         id: String,
         provider: String,

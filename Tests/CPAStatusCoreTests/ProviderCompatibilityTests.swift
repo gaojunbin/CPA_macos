@@ -25,12 +25,17 @@ final class ProviderCompatibilityTests: XCTestCase {
     func testProviderFlowsAndRoutingCatalog() {
         XCTAssertFalse(OAuthProvider.devin.usesDeviceFlow)
         XCTAssertNil(OAuthProvider.devin.callbackPort)
-        XCTAssertEqual(OAuthProvider.devin.authPath, "/v0/management/devin-auth-url")
+        XCTAssertEqual(OAuthProvider.devin.authProvider, "devin")
+        XCTAssertEqual(OAuthProvider.claude.authProvider, "claude")
+        XCTAssertEqual(OAuthProvider.kimiAI.authProvider, "kimi-ai")
         XCTAssertTrue(OAuthProvider.meta.usesDeviceFlow)
         XCTAssertTrue(OAuthProvider.kimiAI.usesDeviceFlow)
         XCTAssertEqual(ProviderCatalog.info(for: "cognition").key, "devin")
         XCTAssertEqual(ProviderCatalog.info(for: "kimi-ai").displayName, "Kimi.ai")
-        XCTAssertFalse(ProviderCatalog.info(for: "meta").supportsUsage)
+        XCTAssertEqual(ProviderCatalog.info(for: "kimi.ai").key, "kimi-ai")
+        XCTAssertEqual(ProviderCatalog.info(for: "kimi_ai").key, "kimi-ai")
+        XCTAssertEqual(ProviderCatalog.info(for: "kimi.com").key, "kimi")
+        XCTAssertTrue(ProviderCatalog.info(for: "meta").supportsUsage)
         XCTAssertEqual(APIKeyChannelKind.meta.definitionsChannel, "meta")
     }
 
